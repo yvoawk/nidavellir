@@ -1,0 +1,9 @@
+positive(rise(a,2)).
+positive(rise(b,2)).
+positive(rise(e,3)).
+negative(rise(a,1)).
+negative(rise(b,1)).
+negative(rise(c,2)).
+negative(rise(d,1)).
+negative(rise(d,2)).
+negative(rise(e,4)).
