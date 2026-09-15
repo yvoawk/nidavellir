@@ -1,6 +1,6 @@
 # Nidavellir
 
-**Nidavellir: A Semantic Compiler for Inductive Logic Programming**
+**Nidavellir: A Semantic Compiler for Finite Inductive Logic Programming**
 
 Nidavellir compiles a finite, explicitly biased inductive logic programming
 (ILP) task into a minimum-cost set of positive rules. It evaluates candidate
