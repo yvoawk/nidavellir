@@ -5,7 +5,7 @@ import shutil
 import sys
 import unittest
 
-from nidavellir.solvers import set_cover_program, solve
+from nidavellir.solvers import _retain_timeout_cover, set_cover_program, solve
 
 
 ILASP = shutil.which("ILASP") or str(Path(sys.executable).parent / "ILASP")
@@ -62,6 +62,26 @@ class SelectionCeilingTests(unittest.TestCase):
         self.assertTrue(result["stats"]["upper_bound_applied"])
         self.assertEqual(result["optimum_cost"], 6)
         self.assertIn(":- #sum { Cost,C : selected(C), candidate(C,Cost) } > 7.", result["program"])
+
+    def test_nonoptimal_greedy_timeout_cover_never_becomes_an_optimum(self):
+        candidates = [{"id": "a", "cost": 3, "coverage": 0b001111},
+                      {"id": "b", "cost": 3, "coverage": 0b010011},
+                      {"id": "c", "cost": 3, "coverage": 0b101100},
+                      {"id": "d", "cost": 2, "coverage": 0b010000},
+                      {"id": "e", "cost": 2, "coverage": 0b100000}]
+        result = solve(candidates, 6, timeout=1e-12, enumerate_optima=True)
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["cost"], 7)
+        self.assertEqual(result["selected"], ["a", "d", "e"])
+        self.assertIsNone(result["optimum_cost"])
+        self.assertFalse(result["enumeration"]["complete"])
+        # A better solver incumbent must survive the same timeout path.
+        result.update(cost=6, selected=["b", "c"])
+        result["stats"]["incumbent_source"] = "solver_model"
+        _retain_timeout_cover(result, candidates, 6)
+        self.assertEqual(result["cost"], 6)
+        self.assertEqual(result["selected"], ["b", "c"])
+        self.assertEqual(result["stats"]["incumbent_source"], "solver_model")
 
     @unittest.skipUnless(Path(ILASP).is_file(), "ILASP binary unavailable")
     def test_empty_and_impossible_catalogues_do_not_use_singleton_reduction(self):

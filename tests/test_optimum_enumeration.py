@@ -49,6 +49,7 @@ class OptimumEnumerationTests(unittest.TestCase):
                     self.assertTrue(result["enumeration"]["complete"])
                     actual = {tuple(h) for h in result["enumeration"]["semantic_hypotheses"]}
                     self.assertEqual(actual, expected)
+                    self.assertEqual(len(actual), result["enumeration"]["hypothesis_count"])
 
     def test_singleton_fast_path_returns_all_tied_covers(self):
         candidates = [{"id": "left", "cost": 3, "coverage": 3},
@@ -63,13 +64,22 @@ class OptimumEnumerationTests(unittest.TestCase):
                       {"id": "second", "cost": 1, "coverage": 2},
                       {"id": "joint", "cost": 2, "coverage": 3}]
         result = solve(candidates, 2, enumerate_optima=True)
-        self.assertEqual(result["enumeration"]["backend"], "clingo_guarded_sum")
+        self.assertEqual(result["enumeration"]["backend"], "clingo_core_guided_optN")
         self.assertEqual(result["enumeration"]["semantic_hypotheses"], [["first", "second"], ["joint"]])
         program = optimal_cover_program(candidates, 2, 2)
         self.assertNotIn("#minimize", program)
         self.assertNotIn("total_cost", program)
         self.assertIn("} < 2.", program)
         self.assertIn("} > 2.", program)
+
+    def test_optimization_models_do_not_consume_enumeration_limit(self):
+        candidates = [{"id": "left", "cost": 2, "coverage": 1},
+                      {"id": "right", "cost": 2, "coverage": 2}]
+        result = enumerate_optimal_covers(candidates, 2, 4, backend="clingo", max_optima=1)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(result["semantic_hypotheses"], [["left", "right"]])
+        self.assertEqual(result["hypothesis_count"], 1)
+        self.assertGreater(result["stats"]["preliminary_models"], 0)
 
     def test_overlapping_multirule_optima_and_single_rule_tie(self):
         candidates = [{"id": "a", "cost": 2, "coverage": 0b011},

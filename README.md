@@ -82,6 +82,16 @@ t(V1) :- q(V1).
 The rule cost is one for the head plus one per selected body literal, so this
 two-rule program has cost four.
 
+Internal selection uses Clingo's core-guided `usc,oll` optimization strategy.
+Use `--internal-opt-strategy bb,lin` to reproduce the previous branch-and-bound
+strategy. Both optimize exactly the same compiled catalogue and objective;
+the chosen strategy is recorded in `solver.json`. If selection times out, the
+best available verified cover is retained, including the greedy cover used to
+bound selection. Its status remains `feasible`, without an optimum proof.
+General optimum enumeration also uses core-guided solving with `optN`, while
+retaining the fixed-cost guards. Preliminary optimization models are excluded
+from counts; only exhausted enumeration establishes a complete optimum set.
+
 ## Input contract
 
 Every run requires three ASP files:

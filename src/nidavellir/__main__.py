@@ -202,6 +202,8 @@ def parser():
     for flag in ("background", "examples", "bias", "output"):
         p.add_argument("--" + flag, type=Path, required=True)
     p.add_argument("--optimizer", choices=("internal", "ilasp"), default="internal")
+    p.add_argument("--internal-opt-strategy", choices=("usc,oll", "bb,lin"), default="usc,oll",
+                   help="internal Clingo optimization strategy; bb,lin reproduces the previous default")
     p.add_argument("--verify-ilasp", action="store_true")
     p.add_argument("--ilasp-binary")
     p.add_argument("--enumerate-optima", action="store_true")
@@ -468,6 +470,7 @@ def run(args):
         update(stage="selection")
         selected = solve(candidates, len(task.positives), backend=args.optimizer,
                          ilasp_binary=args.ilasp_binary, timeout=args.solver_seconds,
+                         internal_opt_strategy=args.internal_opt_strategy,
                          verify_ilasp=args.verify_ilasp,
                          enumerate_optima=args.enumerate_optima, enumeration_backend=args.enumeration_backend,
                          enumeration_timeout=args.enumeration_seconds or args.solver_seconds,
@@ -539,7 +542,7 @@ def run(args):
                    ilasp_verification=selected.get("verification", {}).get("status", "not_requested"))
         elif selected["status"] == "timeout":
             chosen = [c for c in candidates if c["id"] in selected["selected"]]
-            if selected.get("cost") is not None:
+            if selected.get("cost") is not None and (cover is None or selected["cost"] <= bound["cost"]):
                 emit_rules([c["rule"] for c in chosen], selected["cost"], False)
                 update(status="feasible", stage="selection")
             elif cover is not None:

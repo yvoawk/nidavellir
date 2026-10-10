@@ -94,6 +94,25 @@ class CommandLineTests(unittest.TestCase):
         self.assertFalse((output / "first_feasible.lp").exists())
         self.assert_verified(output)
 
+    def test_selection_timeout_emits_greedy_cover_without_initial_bound(self):
+        process, output, status = self.run_compiler(
+            "--bound-seconds", 0, "--solver-seconds", 1e-12, "--enumerate-optima")
+        self.assertEqual(process.returncode, 3, status)
+        self.assertEqual(status["status"], "feasible")
+        self.assertEqual(status["hypothesis_cost"], 4)
+        self.assertIsNone(status["optimal_cost"])
+        solver = self.read(output, "solver.json")
+        self.assertEqual(solver["stats"]["incumbent_source"], "greedy_feasible_cover")
+        self.assertEqual(solver["enumeration"]["status"], "skipped")
+        self.assertFalse((output / "first_feasible.lp").exists())
+        self.assert_verified(output)
+
+    def test_previous_internal_strategy_is_exposed_and_recorded(self):
+        process, output, status = self.run_compiler("--internal-opt-strategy", "bb,lin")
+        self.assertEqual(process.returncode, 0, status)
+        self.assertEqual(status["optimal_cost"], 4)
+        self.assertEqual(self.read(output, "solver.json")["stats"]["optimization_strategy"], "bb,lin")
+
     def test_hard_bound_deadline_falls_back_without_claiming_infeasibility(self):
         process, output, status = self.run_compiler("--bound-seconds", 1e-12)
         self.assertEqual(process.returncode, 0, status)

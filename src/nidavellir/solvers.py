@@ -195,15 +195,33 @@ def _selection(candidates, selected_indices, positive_count):
     return coverage == (1 << positive_count) - 1, cost
 
 
-def _internal(candidates, positive_count, timeout):
+def _retain_timeout_cover(result, candidates, positive_count):
+    """Keep the verified ceiling as an incumbent, without manufacturing a proof."""
+    if result["status"] != "timeout":
+        return
+    certificate = result["stats"].get("feasible_cover")
+    if certificate is None:
+        return
+    identifiers = set(certificate)
+    chosen = [i for i, candidate in enumerate(candidates) if candidate["id"] in identifiers]
+    valid, cost = _selection(candidates, chosen, positive_count)
+    if not valid or len(chosen) != len(certificate) or cost != result["stats"]["feasible_cover_cost"]:
+        raise RuntimeError("Timeout incumbent lacks a valid feasible-cover certificate")
+    if result["cost"] is None or cost < result["cost"]:
+        result.update(cost=cost, selected=[candidates[i]["id"] for i in chosen])
+        result["stats"]["incumbent_source"] = "greedy_feasible_cover"
+
+
+def _internal(candidates, positive_count, timeout, strategy="usc,oll"):
     started = time.perf_counter()
     program, encoding_stats = _set_cover_encoding(candidates, positive_count)
     result = _base("internal", program, started)
     result["stats"].update(encoding_stats)
+    result["stats"]["optimization_strategy"] = strategy
     messages = []
     try:
         import clingo
-        control = clingo.Control(["--opt-mode=opt", "--models=0"],
+        control = clingo.Control(["--opt-mode=opt", "--models=0", "--opt-strategy=" + strategy],
                                  logger=lambda code, message: messages.append(message))
         control.add("base", [], program)
         grounding_started = time.perf_counter()
@@ -235,6 +253,7 @@ def _internal(candidates, positive_count, timeout):
             if best is not None:
                 result["cost"] = best[0]
                 result["selected"] = [candidates[i]["id"] for i in best[1]]
+                result["stats"]["incumbent_source"] = "solver_model"
             if answer.exhausted and answer.satisfiable:
                 result.update(status="complete", optimum_cost=best[0])
             elif answer.unsatisfiable and answer.exhausted:
@@ -248,6 +267,7 @@ def _internal(candidates, positive_count, timeout):
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
     result["stderr"] = "\n".join(messages)
+    _retain_timeout_cover(result, candidates, positive_count)
     result["elapsed_seconds"] = time.perf_counter() - started
     return result
 
@@ -337,6 +357,7 @@ def _ilasp(candidates, positive_count, timeout, binary):
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
+        _retain_timeout_cover(result, candidates, positive_count)
         result["elapsed_seconds"] = time.perf_counter() - started
     return result
 
@@ -409,12 +430,18 @@ def enumerate_optimal_covers(candidates, positive_count, optimum_cost, *,
             result["error"] = "No cover at supplied optimum cost; the caller's cost proof is inconsistent"
             return finish("error")
         return finish("complete")
-    result["backend"] = "clingo_guarded_sum"
+    # Retain the fixed-cost guards, but keep the objective so core-guided
+    # propagation can establish useful constraints before optN enumerates ties.
+    # Pure SAT enumeration can stall before its first model on tight covers.
+    program += "#minimize { Cost,C : selected(C), candidate(C,Cost) }.\n"
+    result.update(backend="clingo_core_guided_optN", program=program)
+    result["stats"].update(optimization_strategy="usc,oll", preliminary_models=0)
     messages = []
     try:
         import clingo
 
-        control = clingo.Control(["0"], logger=lambda _, message: messages.append(message))
+        control = clingo.Control(["0", "--opt-mode=optN", "--opt-strategy=usc,oll"],
+                                 logger=lambda _, message: messages.append(message))
         control.add("base", [], program)
         grounding_started = time.perf_counter()
         control.ground([("base", [])])
@@ -429,6 +456,12 @@ def enumerate_optimal_covers(candidates, positive_count, optimum_cost, *,
             if time.perf_counter() >= deadline:
                 stopped = "timeout"
                 return False
+            if not model.optimality_proven:
+                # optN reports optimization models before enumerating every
+                # optimum. Counting these would duplicate covers and consume
+                # max_optima prematurely.
+                result["stats"]["preliminary_models"] += 1
+                return True
             chosen = sorted(atom.arguments[0].number for atom in model.symbols(shown=True)
                             if atom.name == "selected" and len(atom.arguments) == 1)
             valid, cost = _selection(candidates, chosen, positive_count)
@@ -452,7 +485,7 @@ def enumerate_optimal_covers(candidates, positive_count, optimum_cost, *,
             return finish(stopped)
         if not finished or answer.interrupted:
             return finish("timeout")
-        if answer.exhausted and answer.satisfiable:
+        if answer.exhausted and answer.satisfiable and result["semantic_hypotheses"]:
             return finish("complete")
         result["error"] = "No cover at supplied optimum cost, or enumeration did not finish with a proof"
         return finish("error")
@@ -536,6 +569,7 @@ def expand_optimal_programs(candidates, semantic_hypotheses, *, timeout=None, ma
 
 def solve(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
           backend: str = "internal", ilasp_binary: str | Path | None = None,
+          internal_opt_strategy: str = "usc,oll",
           timeout: float | None = None, verify_ilasp: bool = False,
           enumerate_optima: bool = False, enumeration_backend: str = "auto",
           enumeration_timeout: float | None = None, max_optima: int | None = None,
@@ -545,7 +579,9 @@ def solve(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
     ``timeout`` is a separate budget for selection and optional ILASP verification.
     Internal grounding is timed but cannot be interrupted by the Python solve
     handle; any overrun prevents a subsequent solve. An interrupted search can
-    return an incumbent ``cost``, but never an ``optimum_cost``.
+    return the better of its incumbent and the verified greedy cover as ``cost``,
+    but never an ``optimum_cost``. Internal optimization defaults to core-guided
+    ``usc,oll``; ``bb,lin`` remains available for controlled comparisons.
 
     Verification checks cost and coverage, allowing different tied optimal covers.
     A failed/unavailable verification is reported separately and does not invalidate
@@ -567,11 +603,13 @@ def solve(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
     candidates = _catalogue(original_candidates, positive_count)
     if backend not in {"internal", "ilasp"}:
         raise ValueError("backend must be 'internal' or 'ilasp'")
+    if internal_opt_strategy not in {"usc,oll", "bb,lin"}:
+        raise ValueError("internal_opt_strategy must be 'usc,oll' or 'bb,lin'")
     if timeout is not None and (isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("timeout must be a finite positive number, or None")
     if verify_ilasp and backend != "internal":
         raise ValueError("verify_ilasp applies to the internal weighted set-cover backend")
-    result = (_internal(candidates, positive_count, timeout) if backend == "internal" else
+    result = (_internal(candidates, positive_count, timeout, internal_opt_strategy) if backend == "internal" else
               _ilasp(candidates, positive_count, timeout, ilasp_binary))
     result["stats"].update(candidate_count=len(candidates), positive_count=positive_count)
     result["scope"] = "finite negative-safe coverage catalogue only"

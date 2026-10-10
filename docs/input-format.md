@@ -3,7 +3,7 @@
 Nidavellir accepts three paths: `--background`, `--examples`, and `--bias`.
 All inputs use Clingo/ASP syntax and are normalized into hashed snapshots inside
 the output directory. This document is the normative public input contract for
-version 0.3.25.
+version 0.3.26.
 
 ## Background knowledge (BK)
 
