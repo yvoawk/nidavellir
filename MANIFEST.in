@@ -4,4 +4,5 @@ include README.md
 graft docs
 graft examples
 graft tests
+prune docs/research
 global-exclude __pycache__ *.py[cod] .DS_Store

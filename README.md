@@ -9,7 +9,7 @@ exact positive coverage, rejects rules covering supplied negative examples,
 and solves the resulting weighted set-cover problem.
 
 The compiler is domain independent. Its three inputs are a background
-knowledge file (BK), hard positive and negative examples, and an ASP bias that
+knowledge file (BK), positive and negative examples (hard by default), and an ASP bias that
 defines the finite rule language.
 
 ## Requirements
@@ -94,14 +94,59 @@ from counts; only exhausted enumeration establishes a complete optimum set.
 
 ## Input contract
 
+### Optional partial positive coverage
+
+Add `--allow-partial-coverage` to maximize the number of covered positive
+examples, then minimize the total rule cost among all programs reaching that
+maximum. Supplied negative examples remain hard constraints. The default,
+without this flag, still requires every positive example.
+
+```bash
+nidavellir \
+  --background examples/partial_coverage/background.lp \
+  --examples examples/partial_coverage/examples.lp \
+  --bias examples/partial_coverage/bias.lp \
+  --allow-partial-coverage \
+  --output /tmp/nidavellir-partial
+```
+
+This example has one coverable positive and two uncoverable positives. A
+complete run has `optimum_objective: [2, 2]`: two missed positives, then minimum
+rule cost two. `complete` describes the optimization proof, not full recall.
+
+`coverage.json` records the maximum achievable coverage, the exact uncoverable
+labels, achieved recall, and separate coverage/cost proof fields. The original
+labels remain in the input snapshot. `verification.json` independently checks
+the learned rules and retains `missing_positives`; `hard_labels_matched` can be
+false while the hypothesis is valid under the selected partial objective.
+
+Both compiler backends, both optimizers, separate/grouped targets, and optional
+optimum/variant enumeration support the flag. The full-cover bound worker and
+its per-target cost bounds are disabled for this mode; `--resume-bound` is
+incompatible. Compilation must finish before maximum coverage is certified.
+A selection timeout may retain a maximum-coverage hypothesis without proving
+minimum cost. An empty positive set has recall 1 by convention; when no
+positive is coverable, the empty program is the cost-zero optimum.
+
+The Python selection API accepts `solve(..., allow_partial_coverage=True)`.
+Its proof is relative to the supplied catalogue; callers must independently
+establish coverage masks, negative safety, and language completeness.
+
+This is an unweighted lexicographic objective. It does not permit false
+positives or trade positive errors against shorter rules. Training recall is
+not held-out accuracy or a confidence estimate.
+
+### Input files
+
 Every run requires three ASP files:
 
 1. `background.lp` is the BK. It must define one finite, fixed interpretation
    using facts and supported acyclic normal rules. Target predicates must not
    occur in the BK.
-2. `examples.lp` contains ground hard labels of the form `positive(atom).` and
+2. `examples.lp` contains ground labels of the form `positive(atom).` and
    `negative(atom).`. Unlabelled target atoms are unconstrained; Nidavellir does
-   not apply a closed-world assumption to them.
+   not apply a closed-world assumption to them. Both polarities are hard by
+   default; the partial-coverage option relaxes positive coverage only.
 3. `bias.lp` declares ground `candidate_head/1`, `allowed_literal/1`, and exactly
    one nonnegative `max_body/1` fact. It also defines legal selections through
    `head/1` and `body/1` in the ASP meta-language.
@@ -158,8 +203,8 @@ checked against all supplied hard labels in the original BK.
 
 Important boundaries:
 
-- A `feasible` result is verified as covering the supplied positives and no
-  supplied negatives, but is not a proof of optimality.
+- A `feasible` result satisfies the selected coverage mode and covers no
+  supplied negatives, but is not a proof of minimum cost.
 - A timeout or resource limit means `incomplete`, never unsatisfiable.
 - Catalogue completion does not automatically enumerate every tied optimum or
   every alpha-renamed spelling. Request `--enumerate-optima --expand-variants`
@@ -168,7 +213,7 @@ Important boundaries:
   compiled finite catalogue. It is not an independent reconstruction of the
   original unrestricted ILASP hypothesis space.
 - Guarantees are relative to a finite positive-rule language, a unique acyclic
-  BK interpretation, explicit hard labels, and the exact supplied bias.
+  BK interpretation, explicit labels, the selected coverage objective, and the exact supplied bias.
 - Runtime and memory can grow rapidly with the grounded BK, hidden variables,
   join density, number of allowed literals, `max_body`, and number of tied
   programs.

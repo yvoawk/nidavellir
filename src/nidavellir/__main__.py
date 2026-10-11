@@ -24,41 +24,7 @@ from .labels import CompactNegativeSet
 from .terminal_progress import TerminalProgress
 
 
-class JsonArray:
-    """Mark a lazily generated JSON array without materializing its values."""
-
-    def __init__(self, values):
-        self.values = values
-
-
-def write_json(path, data, *, deadline=None):
-    """Atomically write nested JSON, including large streamed arrays."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    def emit(stream, value):
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError("Preparation exceeded its wall-clock budget")
-        if isinstance(value, dict):
-            stream.write("{")
-            for position, (key, item) in enumerate(value.items()):
-                if position:
-                    stream.write(",")
-                stream.write(json.dumps(key, ensure_ascii=False) + ":")
-                emit(stream, item)
-            stream.write("}")
-        elif isinstance(value, (list, tuple, JsonArray)):
-            stream.write("[")
-            values = value.values if isinstance(value, JsonArray) else value
-            for position, item in enumerate(values):
-                if position:
-                    stream.write(",")
-                emit(stream, item)
-            stream.write("]")
-        else:
-            json.dump(value, stream, ensure_ascii=False)
-    with temporary.open("w", buffering=1024 * 1024) as stream:
-        emit(stream, data)
-        stream.write("\n")
-    temporary.replace(path)
+from .json_stream import JsonArray, write_json
 
 
 def file_digest(path):
@@ -202,6 +168,8 @@ def parser():
     for flag in ("background", "examples", "bias", "output"):
         p.add_argument("--" + flag, type=Path, required=True)
     p.add_argument("--optimizer", choices=("internal", "ilasp"), default="internal")
+    p.add_argument("--allow-partial-coverage", action="store_true",
+                   help="maximize covered positives, then minimize rule cost; negatives stay strict (default: require every positive)")
     p.add_argument("--internal-opt-strategy", choices=("usc,oll", "bb,lin"), default="usc,oll",
                    help="internal Clingo optimization strategy; bb,lin reproduces the previous default")
     p.add_argument("--verify-ilasp", action="store_true")
@@ -278,6 +246,10 @@ def run(args):
               "backend": {"optimized": "guarded_reduced_bitmasks", "projected": "projected_truth_vector_bitmasks",
                           "cartesian": "cartesian_reference_bitmasks"}[args.oracle_backend], "optimal_cost": None,
               "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
+    partial = args.allow_partial_coverage
+    status.update(coverage_mode="partial" if partial else "strict",
+                  objective="lexicographic_missed_positives_then_rule_cost" if partial else "minimum_cost_complete_cover")
+    coverage_report = None
     cover = None
     task = None
     terminal = TerminalProgress(args.verbose, target=args.target_signature)
@@ -296,10 +268,20 @@ def run(args):
         terminal.emit(event)
 
     def emit_rules(rules, cost, optimal):
-        verification = verify_rules(task, rules)
+        verification = verify_rules(task, rules, allow_partial_coverage=partial)
         write_json(output / "verification.json", verification)
         if not verification["matched"]:
             raise AssertionError("Learned rules failed independent original-BK verification")
+        if partial:
+            if coverage_report is None or verification["missing_positives"] != coverage_report["uncoverable_positives"]:
+                raise AssertionError("Independent positive coverage disagrees with the compiled maximum")
+            coverage_report.update(covered_positives=verification["covered_positives"],
+                missed_positives=verification["missed_positives"], positive_recall=verification["positive_recall"],
+                covered_negatives=len(verification["covered_negatives"]), cost_optimal=optimal,
+                hypothesis_cost=cost, optimum_cost=cost if optimal else None)
+            write_json(output / "coverage.json", coverage_report)
+            update(coverage=coverage_report,
+                   optimum_objective=[verification["missed_positives"], cost] if optimal else None)
         (output / "learned.lp").write_text("\n".join(rules) + "\n")
         (output / "predictions.lp").write_text("\n".join(a + "." for a in verification["predictions"]) + "\n")
         update(hypothesis_cost=cost, optimal_cost=cost if optimal else None,
@@ -347,6 +329,10 @@ def run(args):
         planning["elapsed_seconds"] = time.monotonic() - planning_started
         write_json(output / "planning.json", planning)
         strategy = args.bound_strategy
+        if partial:
+            if args.resume_bound:
+                raise TaskError("--allow-partial-coverage cannot resume a strict full-cover bound")
+            strategy = "off"
         if strategy == "auto":
             strategy = "bitmask" if compiler_backend == "bitmask" else "relational"
         if compiler_backend == "relational" and strategy == "bitmask":
@@ -360,6 +346,8 @@ def run(args):
         fingerprint = hashlib.sha256(json.dumps({"snapshots": manifest["sha256"],
                          "engine": manifest["engine_sha256"], "clingo": clingo.__version__}, sort_keys=True).encode()).hexdigest()
         bound = {"status": "disabled", "cost": None, "elapsed_seconds": 0}
+        if partial:
+            bound["reason"] = "Partial coverage compiles the full language without full-cover cost bounds"
         if not task.positives:
             cover, bound = [], {"status": "verified", "cost": 0, "rules": [], "elapsed_seconds": 0}
         elif strategy == "relational":
@@ -446,7 +434,7 @@ def run(args):
         update(stage="compilation")
         from .target_bounds import costs_from_certificates
         target_costs = (costs_from_certificates(task, bound.get("target_bounds", {}))
-                        if args.per_target_bounds else None)
+                        if args.per_target_bounds and not partial else None)
         if compiler_backend == "relational" and task.positives:
             from .relational_compile import compile_catalogue as compile_relational
             candidates, compilation = compile_relational(task, relational_oracle, bound=bound["cost"],
@@ -465,8 +453,23 @@ def run(args):
                 alpha_collect=not args.raw_alpha_variants, target_bounds=target_costs)
         serial = [dict(c, coverage=hex(c["coverage"])) for c in candidates]
         write_json(output / "catalogue.json", {"stats": compilation, "candidates": serial})
-        (output / "compiled_set_cover.lp").write_text(set_cover_program(candidates, len(task.positives)))
-        (output / "compiled_ilasp.las").write_text(selection_task(candidates, len(task.positives)))
+        if not compilation.get("complete"):
+            raise ResourceLimit("Catalogue compilation did not finish with a completeness proof", compilation)
+        if partial:
+            from .solvers import _partial_catalogue
+            _, quantified = _partial_catalogue(candidates, len(task.positives))
+            labels = list(map(str, sorted(task.positives)))
+            coverage_report = dict(quantified,
+                uncoverable_positives=sorted(labels[i] for i in quantified["uncoverable_positive_indices"]),
+                scope="complete supplied finite language; strict explicit negatives; training labels only",
+                catalogue_complete=True, cost_optimal=False,
+                covered_positives=None, missed_positives=None, positive_recall=None)
+            write_json(output / "coverage.json", coverage_report)
+            update(coverage=coverage_report)
+        (output / "compiled_set_cover.lp").write_text(set_cover_program(candidates, len(task.positives),
+                                                    allow_partial_coverage=partial))
+        (output / "compiled_ilasp.las").write_text(selection_task(candidates, len(task.positives),
+                                                 allow_partial_coverage=partial))
         update(stage="selection")
         selected = solve(candidates, len(task.positives), backend=args.optimizer,
                          ilasp_binary=args.ilasp_binary, timeout=args.solver_seconds,
@@ -474,7 +477,8 @@ def run(args):
                          verify_ilasp=args.verify_ilasp,
                          enumerate_optima=args.enumerate_optima, enumeration_backend=args.enumeration_backend,
                          enumeration_timeout=args.enumeration_seconds or args.solver_seconds,
-                         max_optima=args.max_optima, expand_variants=False)
+                         max_optima=args.max_optima, expand_variants=False,
+                         allow_partial_coverage=partial)
         if selected["status"] == "complete":
             chosen = [c for c in candidates if c["id"] in selected["selected"]]
             emit_rules([c["rule"] for c in chosen], selected["optimum_cost"], True)
@@ -554,7 +558,7 @@ def run(args):
             update(status="error", reason=selected.get("error") or selected.get("stderr") or "Solver error")
     except ResourceLimit as error:
         write_json(output / "resource_limit.json", {"stage": status["stage"], "reason": str(error), "stats": error.stats})
-        if cover is not None:
+        if cover is not None and not partial:
             emit_rules([c["rule"] for c in cover], sum(c["cost"] for c in cover), False)
             update(status="feasible", reason=str(error))
         else:
@@ -570,9 +574,14 @@ def run(args):
                  f"Stage: `{status['stage']}`. Elapsed: {status['elapsed_seconds']:.3f} s.",
                  f"Oracle backend: `{status['backend']}`.",
                  f"Proven optimum: {status['optimal_cost']}.", "",
-                 "Inputs are ground hard labels. Unlabelled outputs are unconstrained.",
+                 ("Positives are maximized before minimizing rule cost; supplied negatives remain hard."
+                  if partial else "Inputs are ground hard labels. Unlabelled outputs are unconstrained."),
                  "ILASP verification, when requested, checks selection from the compiled catalogue.",
                  "`verification.json` checks learned clauses independently in the original BK."]
+        if coverage_report is not None:
+            lines += ["", f"Maximum positive coverage: {coverage_report['maximum_covered_positives']}/{coverage_report['positive_count']}.",
+                      f"Uncoverable positives in this language: {coverage_report['minimum_missed_positives']}.",
+                      "`coverage.json` lists the uncovered labels and separates coverage and cost proofs."]
         if "reason" in status:
             lines += ["", status["reason"]]
         (output / "report.md").write_text("\n".join(lines) + "\n")
@@ -610,6 +619,8 @@ def main():
         p.error("--max-optima requires --enumerate-optima")
     if args.verify_ilasp and args.optimizer != "internal":
         p.error("--verify-ilasp verifies the internal optimizer; use --optimizer internal")
+    if args.allow_partial_coverage and args.resume_bound:
+        p.error("--allow-partial-coverage cannot resume a strict full-cover bound")
     if args.output.exists():
         p.error("output directory already exists; use a new directory")
     if args.target_mode == "separate" and not args.target_signature:

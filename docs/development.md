@@ -63,7 +63,8 @@ join, projection, cache, dominance rule, or prefix filter.
 Before release:
 
 1. Compare `nidavellir --help` with every documented option.
-2. Run both repository examples exactly as shown in the README.
+2. Run the repository examples exactly as shown in the README, including the
+   opt-in partial-coverage example.
 3. Inspect `status.json`, `learned.lp`, and `verification.json` for each run.
 4. Run the installed command from a directory outside the checkout.
 5. Run the complete test suite and record skipped optional integrations.

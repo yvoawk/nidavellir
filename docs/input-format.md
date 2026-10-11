@@ -3,7 +3,7 @@
 Nidavellir accepts three paths: `--background`, `--examples`, and `--bias`.
 All inputs use Clingo/ASP syntax and are normalized into hashed snapshots inside
 the output directory. This document is the normative public input contract for
-version 0.3.26.
+version 0.3.27.
 
 ## Background knowledge (BK)
 
@@ -46,7 +46,7 @@ is therefore the fixed world used for compilation and final verification.
 
 ## Positive and negative examples
 
-Examples are ground hard labels:
+Examples are ground labels, treated as hard constraints by default:
 
 ```prolog
 positive(reachable(a)).
@@ -65,11 +65,17 @@ supported syntax falls back to exact Clingo normalization.
 
 Labels are explicit:
 
-- Every positive must be covered by at least one selected rule.
+- By default, every positive must be covered by at least one selected rule.
 - No negative may be covered by any selected rule.
 - Unlabelled target atoms are unconstrained and may be predicted.
 
 This is not a closed-world interpretation of missing labels.
+
+With `--allow-partial-coverage`, positive coverage becomes the first optimization
+objective: maximize the number of covered positives, then minimize program cost.
+Negative labels remain hard constraints. See
+[Semantics and guarantees](semantics-and-guarantees.md) for proof and status
+semantics in this mode.
 
 ## Bias metadata
 
@@ -150,8 +156,9 @@ necessary conditions; final candidate legality remains an exact bias check.
 
 The explicit templates and `max_body/1` define the finite hypothesis language.
 A rule with `k` body literals costs `k + 1`. Program cost is the sum of its rule
-costs. Selection minimizes that additive cost while covering all positive
-examples.
+costs. By default, selection minimizes that additive cost while covering all
+positive examples. With `--allow-partial-coverage`, cost is minimized among
+programs that cover the maximum achievable number of positives.
 
 Duplicate semantic coverage does not automatically erase all syntax: a
 strictly more expensive rule may be dominated, while equal-cost structural

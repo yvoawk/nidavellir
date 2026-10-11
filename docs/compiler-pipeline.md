@@ -35,7 +35,17 @@ Automatic planning selects the bitmask backend when the proved reductions leave
 at most two hidden variables, otherwise the relational backend. The analysis and
 choice are stored in `planning.json`.
 
+The ground prefix filter also handles conjunctions of unit-weight cardinality
+conditions, including a used variable requiring one of several binders. It
+rejects a prefix only if an integrity constraint must be violated. An accepted
+prefix need not have a legal completion: complete candidates still pass the
+exact ASP checker. Unsupported ground definitions retain the solver fallback.
+
 ## 4. Search for a feasible upper bound
+
+With `--allow-partial-coverage`, this phase and all full-cover cost bounds are
+disabled. Compilation uses the original grammar limit; partial coverage is
+quantified only after the catalogue is complete.
 
 A separate worker tries to find a multi-rule hypothesis that covers all
 positives and no negatives. The short phase considers small legal components;
@@ -57,6 +67,18 @@ their fingerprints match.
 The bitmask family groups ground substitutions by truth-vector behavior. The
 relational family builds indexed relations and computes atomic positive masks
 without materializing the whole Cartesian witness space.
+
+The optimized bitmask oracle can restrict a hidden variable to the outputs of
+head-determined functional carriers. Two proofs are required: functionality in
+the fixed BK, and bias UNSAT when a legal body uses that variable but selects
+none of those carriers. The union of carrier outputs preserves every legal
+body's witnesses; variables unused by a body retain an arbitrary completion.
+For at most 65,536 remaining assignments per labelled head, grouped relation
+lookups enumerate truth profiles directly. Larger products retain the projected
+solver. `oracle.json` records the proved carriers and execution counts.
+
+Oracle diagnostics remain streamed: individual records use the standard JSON
+encoder, with bounded buffering and atomic file replacement.
 
 Atomic masks are only upper bounds for conjunctions: two literals can each
 match a positive label through incompatible hidden bindings. Exact joint
@@ -83,6 +105,13 @@ The result is `catalogue.json`, plus an internal Clingo set-cover program and an
 ILASP selection task.
 
 ## 7. Select a minimum-cost program
+
+With `--allow-partial-coverage`, first take the union of all safe candidate
+positive masks, then minimize cost over covers of that union. The union is
+the maximum achievable positive coverage. Emit `coverage.json` with original
+uncoverable labels and separate coverage/cost proofs. Both optimizer backends
+and enumeration use the same reduction, with the dense-to-original index map
+recorded in the selection artifacts.
 
 The selector chooses a set of candidate rules whose union covers all positive
 positions. Costs are additive even when rules overlap. The default internal

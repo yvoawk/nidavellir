@@ -9,3 +9,5 @@ build/
 dist/
 run/
 runs/
+/explanation.html
+research/

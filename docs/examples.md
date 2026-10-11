@@ -1,6 +1,6 @@
 # Examples
 
-The repository contains two self-contained synthetic examples. Neither needs
+The repository contains three self-contained synthetic examples. None needs
 external data or a domain adapter.
 
 ## Overlapping rules
@@ -59,6 +59,27 @@ python -m nidavellir \
 The expected complete hypothesis has one four-literal rule and cost five. This
 example exercises correlated hidden-variable joins: matching each literal in
 isolation would not be sufficient evidence for the conjunction.
+
+## Partial positive coverage
+
+`examples/partial_coverage` contains three positives, of which only one can be
+covered without covering a negative. The default strict mode therefore reports
+`unsatisfiable`.
+
+```bash
+nidavellir \
+  --background examples/partial_coverage/background.lp \
+  --examples examples/partial_coverage/examples.lp \
+  --bias examples/partial_coverage/bias.lp \
+  --output /tmp/nidavellir-partial \
+  --allow-partial-coverage
+```
+
+The expected complete result covers one positive and no negatives, using one
+one-literal rule of cost two. The lexicographic objective is `[2, 2]`: two
+uncovered positives, then program cost two. `coverage.json` identifies the
+covered and uncovered labels and records the coverage proof. The two equivalent
+predicates `q/1` and `r/1` also permit tied optimal rules.
 
 ## Trying explicit backends
 

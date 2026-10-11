@@ -12,6 +12,7 @@ import time
 import clingo
 
 from .bias_analysis import analyze
+from .conditional_anchors import plan_anchors, restrict_domains, direct_profiles
 from .oracle import MaskIndex, ResourceLimit, match
 from .reduction import guarded_relation, plan_reduction
 from .witness_space import WitnessSpace
@@ -47,7 +48,9 @@ def build_optimized_indices(task, *, seconds=300, max_classes=1_000_000, progres
     stats = {"backend": "guarded_reduced_bitmasks", "materialized_witnesses": 0,
              "compressed_witnesses": 0, "labelled_head_instances": 0,
              "encoded_relation_rows": 0, "local_complement_tuples_examined": 0,
-             "complete": False, "reductions": {}}
+             "complete": False, "reductions": {}, "conditional_anchors": {},
+             "direct_assignments_examined": 0, "direct_label_instances": 0,
+             "projected_label_instances": 0}
 
     def check():
         stats["elapsed_seconds"] = time.monotonic() - started
@@ -71,6 +74,9 @@ def build_optimized_indices(task, *, seconds=300, max_classes=1_000_000, progres
         if plan is None:
             plan = plan_reduction(task, head, head_analysis, space, check)
         stats["reductions"][str(head)] = plan.stats
+        anchors = plan_anchors(task, head, head_analysis, space, plan, check)
+        stats["conditional_anchors"][str(head)] = {
+            str(v): [i for i, _, _ in carriers] for v, carriers in anchors.items()}
         retained = sorted(space.all_vars - plan.eliminated)
         buffers = [bytearray() for _ in task.literals]
         classes = CompactClasses(retained)
@@ -84,67 +90,22 @@ def build_optimized_indices(task, *, seconds=300, max_classes=1_000_000, progres
                 continue
             stats["labelled_head_instances"] += 1
             stats["current_head"] = str(label)
-            domains = space.domains(fixed)
+            domains = restrict_domains(space.domains(fixed), fixed, anchors, space)
             domain_ids = {v: tuple(space.intern(s) for s in values)
                           for v, values in domains.items() if v not in plan.eliminated}
-            control = clingo.Control(["0", "--project=project", "--warn=none"])
-            assignments, truths = {}, []
-            with control.backend() as backend:
-                for v, values in domain_ids.items():
-                    check()
-                    atoms = []
-                    for value in values:
-                        atom = backend.add_atom(clingo.Function("rc_value", [clingo.Number(v), clingo.Number(value)]))
-                        assignments[v, value] = atom
-                        atoms.append(atom)
-                    backend.add_rule(atoms, [], choice=True)
-                    backend.add_rule([], [-a for a in atoms])
-                    backend.add_weight_rule([], 2, [(a, 1) for a in atoms])
-                for i in range(len(task.literals)):
-                    check()
-                    truth = backend.add_atom(clingo.Function("rc_truth", [clingo.Number(i)]))
-                    truths.append(truth)
-                    slots, rows = guarded_relation(space, plan, i, fixed, domains, check)
-                    local_count = prod(len(domain_ids[v]) for v in slots)
-                    if len(rows) > local_count // 2:
-                        bad = backend.add_atom()
-                        backend.add_rule([truth], [-bad])
-                        for n, row in enumerate(product(*(domain_ids[v] for v in slots))):
-                            if n % 1024 == 0:
-                                check()
-                            stats["local_complement_tuples_examined"] += 1
-                            if row not in rows:
-                                backend.add_rule([bad], [assignments[v, x] for v, x in zip(slots, row)])
-                                stats["encoded_relation_rows"] += 1
-                    else:
-                        for n, row in enumerate(rows):
-                            if n % 1024 == 0:
-                                check()
-                            backend.add_rule([truth], [assignments[v, x] for v, x in zip(slots, row)])
-                            stats["encoded_relation_rows"] += 1
-                backend.add_project(truths)
             first_position = len(classes)
-            with control.solve(yield_=True, async_=True) as handle:
-                handle.resume()
-                while True:
+            if anchors and prod(len(values) for values in domain_ids.values()) <= 65536:
+                stats["direct_label_instances"] += 1
+                profiles = direct_profiles(task, space, plan, fixed, domains, check, stats)
+            else:
+                stats["projected_label_instances"] += 1
+                profiles = _projected_profiles(task, space, plan, fixed, domains, domain_ids,
+                                               check, deadline, stats)
+            try:
+                for truth, binding in profiles:
                     check()
-                    if not handle.wait(max(0, deadline - time.monotonic())):
-                        handle.cancel()
-                        check()
-                        raise ResourceLimit("Optimized enumeration interrupted", dict(stats))
-                    model = handle.model()
-                    if model is None:
-                        result = handle.get()
-                        break
-                    truth = sum(1 << i for i, atom in enumerate(truths) if model.is_true(atom))
                     if stats["compressed_witnesses"] >= max_classes:
-                        handle.cancel()
                         raise ResourceLimit("Optimized class limit reached", dict(stats))
-                    binding = dict(fixed)
-                    for symbol in model.symbols(atoms=True):
-                        if symbol.name == "rc_value":
-                            v, x = (arg.number for arg in symbol.arguments)
-                            binding[v] = space.symbols[x]
                     position = len(classes)
                     classes.append(label, truth, binding)
                     byte, offset = divmod(position, 8)
@@ -159,9 +120,8 @@ def build_optimized_indices(task, *, seconds=300, max_classes=1_000_000, progres
                     stats["compressed_witnesses"] += 1
                     if progress and stats["compressed_witnesses"] % 1000 == 0:
                         progress(dict(stats))
-                    handle.resume()
-            if result.unknown or not result.exhausted:
-                raise ResourceLimit("Optimized oracle lacks completeness proof", dict(stats))
+            finally:
+                profiles.close()
             mask = ((1 << (len(classes) - first_position)) - 1) << first_position
             if label in positives:
                 positive_mask |= mask
@@ -176,3 +136,64 @@ def build_optimized_indices(task, *, seconds=300, max_classes=1_000_000, progres
     check()
     stats.update(complete=True, relation_caches=dict(space.stats))
     return indices, stats
+
+
+def _projected_profiles(task, space, plan, fixed, domains, domain_ids, check, deadline, stats):
+    control = clingo.Control(["0", "--project=project", "--warn=none"])
+    assignments, truths = {}, []
+    with control.backend() as backend:
+        for v, values in domain_ids.items():
+            check()
+            atoms = []
+            for value in values:
+                atom = backend.add_atom(clingo.Function("rc_value", [clingo.Number(v), clingo.Number(value)]))
+                assignments[v, value] = atom
+                atoms.append(atom)
+            backend.add_rule(atoms, [], choice=True)
+            backend.add_rule([], [-a for a in atoms])
+            backend.add_weight_rule([], 2, [(a, 1) for a in atoms])
+        for i in range(len(task.literals)):
+            check()
+            truth = backend.add_atom(clingo.Function("rc_truth", [clingo.Number(i)]))
+            truths.append(truth)
+            slots, rows = guarded_relation(space, plan, i, fixed, domains, check)
+            local_count = prod(len(domain_ids[v]) for v in slots)
+            if len(rows) > local_count // 2:
+                bad = backend.add_atom()
+                backend.add_rule([truth], [-bad])
+                for n, row in enumerate(product(*(domain_ids[v] for v in slots))):
+                    if n % 1024 == 0:
+                        check()
+                    stats["local_complement_tuples_examined"] += 1
+                    if row not in rows:
+                        backend.add_rule([bad], [assignments[v, x] for v, x in zip(slots, row)])
+                        stats["encoded_relation_rows"] += 1
+            else:
+                for n, row in enumerate(rows):
+                    if n % 1024 == 0:
+                        check()
+                    backend.add_rule([truth], [assignments[v, x] for v, x in zip(slots, row)])
+                    stats["encoded_relation_rows"] += 1
+        backend.add_project(truths)
+    with control.solve(yield_=True, async_=True) as handle:
+        handle.resume()
+        while True:
+            check()
+            if not handle.wait(max(0, deadline - time.monotonic())):
+                handle.cancel()
+                check()
+                raise ResourceLimit("Optimized enumeration interrupted", dict(stats))
+            model = handle.model()
+            if model is None:
+                result = handle.get()
+                break
+            truth = sum(1 << i for i, atom in enumerate(truths) if model.is_true(atom))
+            binding = dict(fixed)
+            for symbol in model.symbols(atoms=True):
+                if symbol.name == "rc_value":
+                    v, x = (arg.number for arg in symbol.arguments)
+                    binding[v] = space.symbols[x]
+            yield truth, binding
+            handle.resume()
+    if result.unknown or not result.exhausted:
+        raise ResourceLimit("Optimized oracle lacks completeness proof", dict(stats))

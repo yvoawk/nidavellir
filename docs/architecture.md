@@ -13,12 +13,13 @@ proof state.
 | Input model | `task.py`, `labels.py` | Parse and validate BK, examples, bias, variable slots, and compact negative labels |
 | Bias reasoning | `bias_analysis.py`, `bias_cores.py` | Legal-body analysis, guards, prefix conditions, and optional reusable UNSAT cores |
 | Backend planning | `planning.py`, `reduction.py`, `witness_space.py` | Choose an exact representation and derive task-relative reductions |
-| Bitmask compiler | `oracle.py`, `optimized_oracle.py`, `projected_oracle.py`, `search.py` | Materialize or compress witness truth vectors and compile coverage classes |
+| Bitmask compiler | `oracle.py`, `optimized_oracle.py`, `conditional_anchors.py`, `projected_oracle.py`, `search.py` | Materialize or compress witness truth vectors using proved reductions and compile coverage classes |
 | Relational compiler | `relational_coverage.py`, `relational_compile.py`, `indexed_join.py`, `positive_join.py`, `negative_join.py` | Query exact correlated witnesses lazily and compile coverage classes |
 | Feasible bounds | `bound_worker.py`, `bitmask_bound.py`, `relational_bound.py`, `short_bound.py`, `target_bounds.py` | Search for verified upper bounds without conflating failure or timeout with UNSAT |
 | Optimization | `solvers.py` | Internal Clingo weighted set-cover, optional ILASP selection, optimum enumeration, and variant expansion |
 | Verification | `verification.py` | Reground original BK plus emitted rules and recheck every hard label |
 | Diagnostics | `profiling.py`, `join_profile.py`, `oracle_cache.py`, `positive_cores.py`, `positive_support.py` | Reproducible metrics, complete caches, and sound optional pruning evidence |
+| Artifact serialization | `json_stream.py` | Stream lazy JSON arrays with bounded buffering, deadlines, and atomic replacement |
 
 The CLI is the stable user-facing interface in this release. Internal Python
 modules are documented for maintainers but should be treated as provisional APIs.
@@ -63,7 +64,9 @@ checks:
 1. Candidate structure is legal under the exact original bias.
 2. Correlated positive coverage is computed against the fixed BK.
 3. Negative safety is checked against every supplied negative label.
-4. The selected rule set covers every supplied positive.
+4. By default, the selected rule set covers every supplied positive. In optional
+   partial-coverage mode, a complete result proves maximum positive coverage
+   first and minimum cost at that coverage second.
 5. Emitted clauses are independently evaluated with the original BK.
 
 Resource-limit exceptions carry partial statistics but do not publish an

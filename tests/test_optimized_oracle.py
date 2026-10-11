@@ -9,10 +9,11 @@ from itertools import combinations
 from pathlib import Path
 import tempfile
 import unittest
+import random
 
 import clingo
 
-from nidavellir.oracle import build_cartesian_indices
+from nidavellir.oracle import ResourceLimit, build_cartesian_indices
 from nidavellir.optimized_oracle import build_optimized_indices
 from nidavellir.task import Task
 
@@ -132,6 +133,71 @@ class OptimizedOracleContractTests(unittest.TestCase):
         self.compare_legal_bodies(self.task(
             "p(a).", ["p(var__(1))", "absent(var__(2))"], ["answer(a)"], ["answer(b)"], max_body=2))
         self.compare_legal_bodies(self.task("unrelated(a).", [], ["success"], heads=("success",), max_body=0))
+
+    def test_conditional_functional_anchors_keep_shared_correlations(self):
+        task = self.task(
+            "base(a). base(b). base(c). r(a,x). s(a,y). r(b,z). s(b,z). "
+            "mark(x). mark(z). link(x,y). link(z,z).",
+            ["base(var__(1))", "r(var__(1),var__(2))", "s(var__(1),var__(2))",
+             "r(var__(1),var__(3))", "s(var__(1),var__(3))",
+             "mark(var__(2))", "link(var__(2),var__(3))"],
+            ["answer(a)", "answer(c)"], ["answer(b)"], max_body=3,
+            bias="used(2) :- body(mark(var__(2))). used(2) :- body(link(var__(2),var__(3))). "
+                 "used(3) :- body(link(var__(2),var__(3))). "
+                 ":- used(V), not body(r(var__(1),var__(V))), not body(s(var__(1),var__(V))).")
+        _, stats = self.compare_legal_bodies(task)
+        self.assertEqual(set(stats["conditional_anchors"][str(task.heads[0])]), {"2", "3"})
+        self.assertEqual(stats["direct_label_instances"], 3)
+        self.assertEqual(stats["projected_label_instances"], 0)
+
+    def test_conditional_anchors_require_a_bias_proof_and_a_functional_relation(self):
+        for extra, bias in (("", ""), ("r(a,y).", ":- body(mark(var__(2))), not body(r(var__(1),var__(2))), not body(s(var__(1),var__(2))).")):
+            task = self.task(
+                "base(a). base(b). r(a,x). s(b,z). mark(x). mark(y). " + extra,
+                ["base(var__(1))", "r(var__(1),var__(2))", "s(var__(1),var__(2))", "mark(var__(2))"],
+                ["answer(a)"], ["answer(b)"], bias=bias)
+            _, stats = self.compare_legal_bodies(task)
+            self.assertEqual(stats["conditional_anchors"][str(task.heads[0])], {})
+            self.assertEqual(stats["direct_label_instances"], 0)
+
+    def test_conditional_anchors_support_nested_terms_and_repeated_head_variables(self):
+        task = self.task(
+            "r(a,box(x,x)). s(a,box(y,y)). r(b,box(z,z)). s(b,box(z,z)). "
+            "r(c,box(x,y)). mark(x). mark(z).",
+            ["r(var__(1),box(var__(2),var__(2)))", "s(var__(1),box(var__(2),var__(2)))", "mark(var__(2))"],
+            ["answer(a,a)"], ["answer(b,b)", "answer(c,c)"], heads=("answer(var__(1),var__(1))",),
+            bias=":- body(mark(var__(2))), not body(r(var__(1),box(var__(2),var__(2)))), not body(s(var__(1),box(var__(2),var__(2)))).")
+        _, stats = self.compare_legal_bodies(task)
+        self.assertEqual(stats["direct_label_instances"], 3)
+
+    def test_conditional_anchor_random_relations_and_resource_limit(self):
+        for seed in range(12):
+            rng = random.Random(seed)
+            facts = [f"base({head})." for head in "abc"]
+            facts += [f"{pred}({head},{rng.choice('xyz')})." for pred in ("r", "s")
+                      for head in "abc" if rng.random() > .2]
+            facts += [f"link({left},{right})." for left in "xyz" for right in "xyz" if rng.random() < .5]
+            task = self.task(" ".join(facts),
+                ["base(var__(1))", "r(var__(1),var__(2))", "s(var__(1),var__(2))",
+                 "r(var__(1),var__(3))", "s(var__(1),var__(3))", "link(var__(2),var__(3))"],
+                ["answer(a)", "answer(c)"], ["answer(b)"], max_body=3,
+                bias=":- body(link(var__(2),var__(3))), not body(r(var__(1),var__(2))), not body(s(var__(1),var__(2))). "
+                     ":- body(link(var__(2),var__(3))), not body(r(var__(1),var__(3))), not body(s(var__(1),var__(3))).")
+            with self.subTest(seed=seed):
+                self.compare_legal_bodies(task)
+                with self.assertRaises(ResourceLimit):
+                    build_optimized_indices(task, max_classes=1)
+
+    def test_head_dependent_cover_is_preferred_only_after_proof(self):
+        restriction = ":- body(mark(var__(2))), not body(r(var__(1),var__(2))), not body(s(var__(1),var__(2)))."
+        for bias in (restriction, ""):
+            task = self.task("base(a). base(b). r(a,y). s(a,z). r(b,x). mark(x).",
+                ["base(var__(1))", "r(var__(1),var__(2))", "s(var__(1),var__(2))", "mark(var__(2))"],
+                ["answer(a)"], ["answer(b)"], bias=bias)
+            _, stats = self.compare_legal_bodies(task)
+            carriers = stats["conditional_anchors"][str(task.heads[0])]["2"]
+            mark = task.literals.index(clingo.parse_term("mark(var__(2))"))
+            self.assertEqual(mark in carriers, not bool(bias))
 
 
 if __name__ == "__main__":

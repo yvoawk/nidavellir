@@ -60,6 +60,7 @@ class PrefixFilter:
     skipped_constraints: int
     deletion_monotone: int = 0
     deletion_checks: tuple = ()
+    conjunctions: tuple = ()
 
     def allows(self, selected, excluded):
         for positive, negative in self.nogoods:
@@ -71,6 +72,18 @@ class PrefixFilter:
                 return False
             if lower is not None and ((positive & ~excluded).bit_count()
                                       + (negative & ~selected).bit_count() < lower):
+                return False
+        for terms in self.conjunctions:
+            # A ground integrity constraint rejects only when every bound in
+            # its body is already true under every completion of the prefix.
+            for positive, negative, lower, upper in terms:
+                if lower is not None and ((selected & positive).bit_count()
+                                          + (excluded & negative).bit_count() < lower):
+                    break
+                if upper is not None and ((positive & ~excluded).bit_count()
+                                          + (negative & ~selected).bit_count() > upper):
+                    break
+            else:
                 return False
         return True
 
@@ -133,6 +146,10 @@ def _prefix_filter(observer, body_atoms, guards=None, fixed_atoms=None):
             _, terms, lower, upper = value
             # The only bounds introduced by ground weight rules have one end.
             return ("bound", terms, None, lower - 1) if lower is not None else ("bound", terms, upper + 1, None)
+        if value is not None and value[0] in {"and", "or"}:
+            terms = tuple(invert(term) for term in value[1])
+            if all(term is not None for term in terms):
+                return ("or" if value[0] == "and" else "and", terms)
         return None
     def literal(atom):
         sign, atom = atom > 0, abs(atom)
@@ -200,15 +217,13 @@ def _prefix_filter(observer, body_atoms, guards=None, fixed_atoms=None):
         if len(values) != len(set(values)):
             return None
         return ("bound", tuple(values), lower, None)
-    nogoods, bounds, skipped, compiled = set(), set(), 0, 0
+    nogoods, bounds, conjunctions, skipped, compiled = set(), set(), set(), 0, 0
     def bits(terms):
         return (sum(1 << (i - 1) for i in set(terms) if i > 0),
                 sum(1 << (-i - 1) for i in set(terms) if i < 0))
-    for rule in constraints:
-        value = expression(rule)
+    def lower_constraint(value):
         if value is False:
-            compiled += 1
-            continue
+            return True
         if value is True:
             nogoods.add((0, 0))
         elif type(value) is int:
@@ -220,7 +235,25 @@ def _prefix_filter(observer, body_atoms, guards=None, fixed_atoms=None):
             positive, negative = bits(terms)
             bounds.add((positive, negative, upper + 1 if upper is not None else None,
                         lower - 1 if lower is not None else None))
+        elif value is not None and value[0] == "and" and all(
+                type(term) is int or (type(term) is tuple and term[0] == "bound")
+                for term in value[1]):
+            terms = []
+            for term in value[1]:
+                if type(term) is int:
+                    terms.append((*bits((term,)), 1, None))
+                else:
+                    _, literals, lower, upper = term
+                    terms.append((*bits(literals), lower, upper))
+            conjunctions.add(tuple(terms))
+        elif value is not None and value[0] == "or":
+            # Forbidding a disjunction forbids each disjunct independently.
+            return all([lower_constraint(term) for term in value[1]])
         else:
+            return False
+        return True
+    for rule in constraints:
+        if not lower_constraint(expression(rule)):
             skipped += 1
             continue
         compiled += 1
@@ -270,7 +303,7 @@ def _prefix_filter(observer, body_atoms, guards=None, fixed_atoms=None):
         done.add(atom)
         return True
     required_free = set(inputs) | {atom for atom, value in fixed_atoms.items() if value}
-    if not skipped and acyclic and required_free <= free and all(no_cycle(a) for a in dependencies):
+    if not skipped and not conjunctions and acyclic and required_free <= free and all(no_cycle(a) for a in dependencies):
         protected = sum(1 << (inputs[a] - 1) for a in forced if a in inputs)
         forced_bits = protected
         for _, negative in nogoods:
@@ -310,7 +343,8 @@ def _prefix_filter(observer, body_atoms, guards=None, fixed_atoms=None):
         nogoods = {(p, n) for p, n in nogoods if not
                    (p.bit_count() == 1 and n and n & sum(1 << i for i in guards[p.bit_length() - 1]))}
     return PrefixFilter(tuple(sorted(nogoods)), tuple(sorted(bounds, key=repr)), tuple(incompatible),
-                        skipped == 0, compiled, skipped, deletion_monotone, deletion_checks)
+                        skipped == 0, compiled, skipped, deletion_monotone, deletion_checks,
+                        tuple(sorted(conjunctions, key=repr)))
 
 
 class _HeadSolver:

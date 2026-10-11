@@ -4,7 +4,9 @@ import clingo
 from .task import signature
 
 
-def verify_rules(task, rules):
+def verify_rules(task, rules, *, allow_partial_coverage=False):
+    if type(allow_partial_coverage) is not bool:
+        raise ValueError("allow_partial_coverage must be a boolean")
     diagnostics = []
     ctl = clingo.Control(["2"], logger=lambda code, text: diagnostics.append(text))
     targets = {signature(h) for h in task.heads}
@@ -21,9 +23,17 @@ def verify_rules(task, rules):
     actual = models[0]
     missing = task.positives - actual
     forbidden = task.negatives & actual
-    return {"matched": not missing and not forbidden,
+    return {"matched": not forbidden and (allow_partial_coverage or not missing),
+            "hard_labels_matched": not missing and not forbidden,
+            "coverage_mode": "partial" if allow_partial_coverage else "strict",
+            "positive_count": len(task.positives),
+            "covered_positives": len(task.positives) - len(missing),
+            "missed_positives": len(missing),
+            "positive_recall": (len(task.positives) - len(missing)) / len(task.positives) if task.positives else 1.0,
             "missing_positives": sorted(map(str, missing)),
             "covered_negatives": sorted(map(str, forbidden)),
             "predictions": sorted(map(str, actual)),
-            "scope": "original BK + learned clauses, all supplied hard labels; unlabelled atoms unconstrained",
+            "scope": ("original BK + learned clauses, strict negatives and quantified positive coverage; no optimality claim"
+                      if allow_partial_coverage else
+                      "original BK + learned clauses, all supplied hard labels; unlabelled atoms unconstrained"),
             "diagnostics": diagnostics}

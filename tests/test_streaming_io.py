@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+import time
+import tracemalloc
 from pathlib import Path
 
 from nidavellir.__main__ import JsonArray, bound_in_subprocess, write_json
@@ -10,6 +12,43 @@ from nidavellir.task import Task, TaskError, read_ground_model
 
 
 class StreamingIOTests(unittest.TestCase):
+    def test_lazy_record_count_does_not_determine_peak_buffer_size(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "out.json"
+            tracemalloc.start()
+            try:
+                write_json(path, JsonArray({"i": i, "text": "x" * 2000} for i in range(10000)))
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertGreater(path.stat().st_size, 20_000_000)
+            self.assertLess(peak, 4_000_000)
+
+    def test_compact_bytes_unicode_and_atomic_failure(self):
+        records = [{"name": "étude\n東京", "number": i / 3, "flag": True,
+                    "nested": [None, {"x": i}]} for i in range(300)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "out.json"
+            write_json(path, {"rows": JsonArray(iter(records))})
+            expected = json.dumps({"rows": records}, ensure_ascii=False, separators=(",", ":")) + "\n"
+            self.assertEqual(path.read_bytes(), expected.encode())
+            with self.assertRaises(TimeoutError):
+                write_json(path, {"rows": JsonArray(iter(records))}, deadline=time.monotonic() - 1)
+            self.assertEqual(path.read_bytes(), expected.encode())
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
+
+    def test_generator_failure_does_not_replace_target(self):
+        def rows():
+            yield {"x": 1}
+            raise ValueError("interrupted input")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "out.json"
+            path.write_text("previous\n")
+            with self.assertRaisesRegex(ValueError, "interrupted input"):
+                write_json(path, JsonArray(rows()))
+            self.assertEqual(path.read_text(), "previous\n")
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
+
     def test_ground_model_transfer_accepts_only_canonical_ground_atoms(self):
         with tempfile.TemporaryDirectory() as folder:
             task = self.task(folder)

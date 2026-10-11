@@ -53,8 +53,47 @@ def _indices(mask: int):
         mask ^= bit
 
 
-def set_cover_program(candidates: Sequence[Mapping[str, Any]], positive_count: int) -> str:
+def _partial_catalogue(candidates, positive_count):
+    """Reduce lexicographic (missed positives, cost) to an exact cover.
+
+    Independent negative-safe rules are compatible, so their union is the
+    unique maximum achievable positive set. Covering that union, then
+    minimizing cost, is exactly the lexicographic objective. The caller must
+    establish catalogue completeness before lifting this proof to its language.
+    Keep the original catalogue immutable and publish the index translation.
+    """
+    checked = _catalogue(candidates, positive_count)
+    union = 0
+    for candidate in checked:
+        union |= candidate["coverage"]
+    positions = list(_indices(union))
+    dense_bits = {i: 1 << j for j, i in enumerate(positions)}
+    remapped = [dict(candidate, coverage=sum(dense_bits[i] for i in _indices(candidate["coverage"])))
+                for candidate in candidates]
+    return remapped, {
+        "positive_count": positive_count,
+        "maximum_covered_positives": len(positions),
+        "minimum_missed_positives": positive_count - len(positions),
+        "maximum_positive_recall": len(positions) / positive_count if positive_count else 1.0,
+        "coverable_positive_indices": positions,
+        "uncoverable_positive_indices": list(_indices(((1 << positive_count) - 1) ^ union)),
+        "maximum_coverage_proven": True,
+        "scope": "supplied finite negative-safe catalogue; language completeness is the caller's obligation",
+    }
+
+
+def _partial_program(program, report):
+    return ("% Partial coverage: lexicographically minimize missed positives, then rule cost.\n"
+            "% Dense positive index -> original index: " +
+            ",".join(map(str, report["coverable_positive_indices"])) + "\n" + program)
+
+
+def set_cover_program(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
+                      allow_partial_coverage: bool = False) -> str:
     """Build the exact internal objective; the candidate id prevents cost merging."""
+    if allow_partial_coverage:
+        candidates, report = _partial_catalogue(list(candidates), positive_count)
+        return _partial_program(_set_cover_encoding(candidates, report["maximum_covered_positives"])[0], report)
     return _set_cover_encoding(candidates, positive_count)[0]
 
 
@@ -174,8 +213,12 @@ def _selection_encoding(candidates, positive_count):
     }
 
 
-def selection_task(candidates: Sequence[Mapping[str, Any]], positive_count: int) -> str:
+def selection_task(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
+                   allow_partial_coverage: bool = False) -> str:
     """Build ILASP's explicit weighted hypothesis space on this same catalogue."""
+    if allow_partial_coverage:
+        candidates, report = _partial_catalogue(list(candidates), positive_count)
+        return _partial_program(_selection_encoding(candidates, report["maximum_covered_positives"])[0], report)
     return _selection_encoding(candidates, positive_count)[0]
 
 
@@ -573,7 +616,8 @@ def solve(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
           timeout: float | None = None, verify_ilasp: bool = False,
           enumerate_optima: bool = False, enumeration_backend: str = "auto",
           enumeration_timeout: float | None = None, max_optima: int | None = None,
-          expand_variants: bool = False, max_programs: int | None = None) -> dict[str, Any]:
+          expand_variants: bool = False, max_programs: int | None = None,
+          allow_partial_coverage: bool = False) -> dict[str, Any]:
     """Return one minimum-cost cover, with explicit completion/proof status.
 
     ``timeout`` is a separate budget for selection and optional ILASP verification.
@@ -591,9 +635,48 @@ def solve(candidates: Sequence[Mapping[str, Any]], positive_count: int, *,
     statuses. Their timeout never erases a proved selection optimum; callers must
     inspect them before claiming that all optimal programs have been returned.
     ``enumeration_timeout`` applies separately to these two optional phases.
+
+    ``allow_partial_coverage`` first maximizes positive coverage, then minimizes
+    cost. No negative-unsafe candidate is permitted. Coverage quantification is
+    relative to the supplied catalogue, never an implicit completeness claim
+    about the caller's language. Empty/all-uncoverable tasks admit the empty
+    optimum. Both backends and enumeration use the same exact union reduction.
     """
     started = time.perf_counter()
     original_candidates = list(candidates)
+    if type(allow_partial_coverage) is not bool:
+        raise ValueError("allow_partial_coverage must be a boolean")
+    if allow_partial_coverage:
+        remapped, coverage = _partial_catalogue(original_candidates, positive_count)
+        result = solve(remapped, coverage["maximum_covered_positives"], backend=backend,
+            ilasp_binary=ilasp_binary, internal_opt_strategy=internal_opt_strategy,
+            timeout=timeout, verify_ilasp=verify_ilasp, enumerate_optima=enumerate_optima,
+            enumeration_backend=enumeration_backend, enumeration_timeout=enumeration_timeout,
+            max_optima=max_optima, expand_variants=expand_variants, max_programs=max_programs)
+        covered = 0
+        for candidate in original_candidates:
+            if candidate["id"] in result["selected"]:
+                covered |= candidate["coverage"]
+        has_hypothesis = result["cost"] is not None
+        coverage.update(
+            covered_positives=covered.bit_count() if has_hypothesis else None,
+            missed_positives=positive_count - covered.bit_count() if has_hypothesis else None,
+            positive_recall=(covered.bit_count() / positive_count if positive_count else 1.0)
+                if has_hypothesis else None,
+            cost_optimal=result["status"] == "complete")
+        result.update(coverage=coverage, coverage_mode="partial",
+            objective="lexicographic_missed_positives_then_rule_cost",
+            optimum_objective=[coverage["minimum_missed_positives"], result["optimum_cost"]]
+                if result["status"] == "complete" else None)
+        result["program"] = _partial_program(result["program"], coverage)
+        result["stats"].update(positive_count=positive_count,
+                              selection_positive_count=coverage["maximum_covered_positives"])
+        for key in ("verification", "enumeration"):
+            if key in result:
+                result[key]["coverage_mode"] = "partial"
+                result[key]["positive_index_map"] = coverage["coverable_positive_indices"]
+        result["elapsed_seconds"] = time.perf_counter() - started
+        return result
     _enumeration_limits(enumeration_timeout, max_optima, "max_optima")
     _enumeration_limits(enumeration_timeout, max_programs, "max_programs")
     if enumeration_backend not in {"auto", "clingo"}:

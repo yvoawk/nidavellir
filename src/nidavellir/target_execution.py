@@ -61,6 +61,7 @@ def prepare(args, output, bias):
                      "examples": str(path.relative_to(output)), "examples_sha256": file_digest(path),
                      "output": f"targets/{identifier}", "status": "pending"})
     manifest = {"version": __version__, "target_mode": "separate", "targets": plan,
+                "coverage_mode": "partial" if args.allow_partial_coverage else "strict",
                 "positive_count": len(positives), "negative_count": len(negatives),
                 "diagnostics": {"bias": diagnostics, "background": messages, "examples": example_messages},
                 "sha256": {p.name: file_digest(p) for p in snap.glob("*.lp")},
@@ -184,6 +185,8 @@ def compose(args, output, plan):
     final = ("invalid_input" if invalid else "error" if failed else "unsatisfiable" if unsat
              else "complete" if optimal else "feasible" if verified else "incomplete")
     result = {"status": final, "optimal_cost": cost, "semantic_verification": verified,
+              "coverage_mode": "partial" if args.allow_partial_coverage else "strict",
+              "objective": "lexicographic_missed_positives_then_rule_cost" if args.allow_partial_coverage else "minimum_cost_complete_cover",
               "completed_targets": sum(s.get("status") in ("complete", "unsatisfiable") for s in states),
               "target_count": len(plan)}
     solvers = [read_json(p / "solver.json") for p in folders]
@@ -201,11 +204,37 @@ def compose(args, output, plan):
         result.update(hypothesis_cost=sum(s["hypothesis_cost"] for s in states),
                       learned_rule_count=sum(s["learned_rule_count"] for s in states))
         solver["cost"] = result["hypothesis_cost"]
+        missing = sorted(atom for folder in folders
+                         for atom in read_json(folder / "verification.json").get("missing_positives", []))
         write_json(output / "verification.json", {
-            "matched": True, "missing_positives": [], "covered_negatives": [],
+            "matched": True, "hard_labels_matched": not missing,
+            "coverage_mode": result["coverage_mode"],
+            "missing_positives": missing, "covered_negatives": [],
             "predictions_file": "predictions.lp",
             "scope": "Composition of independently verified disjoint target programs in the same original BK",
             "targets": {t["signature"]: t["output"] + "/verification.json" for t in plan}})
+    if args.allow_partial_coverage:
+        reports = [read_json(folder / "coverage.json") for folder in folders]
+        proven = all(r.get("maximum_coverage_proven") and r.get("catalogue_complete") for r in reports)
+        total = sum(t["positive_count"] for t in plan)
+        maximum = sum(r["maximum_covered_positives"] for r in reports) if proven else None
+        covered = sum(r["covered_positives"] for r in reports) if verified else None
+        coverage = {"positive_count": total, "maximum_coverage_proven": proven,
+            "catalogue_complete": proven, "maximum_covered_positives": maximum,
+            "minimum_missed_positives": total - maximum if proven else None,
+            "maximum_positive_recall": (maximum / total if total else 1.0) if proven else None,
+            "covered_positives": covered, "missed_positives": total - covered if verified else None,
+            "positive_recall": (covered / total if total else 1.0) if verified else None,
+            "covered_negatives": 0 if verified else None,
+            "uncoverable_positives": sorted(atom for r in reports for atom in r["uncoverable_positives"]) if proven else None,
+            "cost_optimal": optimal, "optimum_cost": cost,
+            "scope": "composition of disjoint target signatures; complete finite language only when every target catalogue is complete",
+            "targets": {t["signature"]: t["output"] + "/coverage.json" for t in plan}}
+        write_json(output / "coverage.json", coverage)
+        result.update(coverage=coverage,
+                      optimum_objective=[total - maximum, cost] if optimal and proven else None)
+        solver.update(coverage=coverage, coverage_mode="partial", objective=result["objective"],
+                      optimum_objective=result["optimum_objective"])
     checks = [s.get("verification", {}) for s in solvers]
     if args.verify_ilasp:
         matches = all(c.get("matches") is True for c in checks)
@@ -254,6 +283,7 @@ def dispatch_separate(args):
     output.mkdir(parents=True, exist_ok=False)
     plan = []
     status = {"status": "running", "stage": "inputs", "version": __version__,
+              "coverage_mode": "partial" if args.allow_partial_coverage else "strict",
               "target_mode": "separate", "backend": "sequential_targets", "optimal_cost": None,
               "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "bound_budget_scope": "per target call", "fresh_process_per_target": True}

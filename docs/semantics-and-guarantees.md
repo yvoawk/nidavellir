@@ -15,6 +15,36 @@ Overlapping coverage is allowed and often necessary. The optimizer solves a
 multi-rule weighted set-cover problem; it does not assume one rule per target or
 one rule per example.
 
+### Opt-in partial coverage
+
+`--allow-partial-coverage` changes the objective to the lexicographic pair
+`(number of missed supplied positives, total rule cost)`. Negatives stay strict.
+This is not a weighted error/cost compromise. The default objective above is
+unchanged. Input consistency and every other task contract still apply.
+
+Let `U` be the union of the exact positive masks of every negative-safe rule.
+Because learned rules are positive and independent, their unions remain safe.
+Thus `U` is attainable and no admissible program covers a positive outside it.
+The selector minimizes cost subject to covering all of `U`. This reduction is
+exact for the lexicographic objective, including ties and empty programs.
+The generated selection encodings use dense indices for `U`, with an explicit
+mapping to the original positive positions. Input labels are never rewritten.
+
+Safe compiler reductions still apply: replacing a rule by a strictly cheaper
+negative-safe rule covering a superset cannot reduce coverage and improves cost
+whenever needed. Equivalent masks preserve their minimum costs and tied
+variants. Full-cover heuristic bounds are disabled; compilation therefore
+retains every signature needed to certify maximum coverage and its minimum
+cost. Target-independent maxima and subsequent minimum costs add across
+signatures, so separate execution is equivalent to grouped execution.
+
+`coverage.json` quantifies training coverage and lists uncoverable labels.
+`maximum_coverage_proven` requires completed compilation at the CLI level.
+`cost_optimal` additionally requires completed selection. A compiler timeout
+is incomplete, even if some useful rules were discovered. A selection timeout
+can retain a verified maximum-coverage cover without an optimal cost. The
+Python selector's coverage certificate concerns only its supplied catalogue.
+
 ## What `complete` guarantees
 
 A top-level `complete` result guarantees, relative to the accepted input
@@ -27,7 +57,9 @@ contract:
 3. The catalogue reductions preserve minimum-cost programs in the finite legal
    grammar.
 4. The emitted hypothesis was independently evaluated in the original fixed BK.
-5. Every supplied positive is predicted and no supplied negative is predicted.
+5. No supplied negative is predicted. In default strict mode every supplied
+   positive is predicted; in partial mode the reported maximum number of
+   positives is predicted and cost is minimal among programs attaining it.
 
 This is a task-relative proof. It does not establish that the BK is a faithful
 model of an external world, that missing labels are negative, or that a better
@@ -43,6 +75,8 @@ These states are deliberately distinct:
   resource budget without a verified hypothesis.
 - `unsatisfiable`: complete candidate compilation and exhausted selection prove
   that no program in the supplied finite language covers the hard labels.
+  Under partial coverage alone, valid tasks always admit at least the empty
+  program, so uncoverable positives are quantified rather than reported UNSAT.
 - `verification_incomplete`: internal selection finished, but requested ILASP
   verification was unavailable or incomplete.
 - `enumeration_incomplete`: an optimum is proved, but the optional enumeration
@@ -52,6 +86,16 @@ A timeout is never converted into UNSAT. A correct prediction file does not by
 itself establish catalogue completeness or global optimality.
 
 ## Candidate and program completeness
+
+Conditional functional domains preserve coverage for every legal body. If a
+body uses a restricted variable, the bias proof forces a selected carrier; its
+functional output is among the retained values. Variables absent from the body
+can be assigned any original-domain value without changing that body's truth.
+Conversely, retained assignments remain actual assignments in the fixed BK.
+Shared variables are evaluated with the same binding across all literals.
+Missing carrier outputs do not become facts, and nonfunctional or unproved
+carriers cannot justify a restriction. This is a legal-body equivalence, not a
+claim that raw profiles or illegal bodies have identical truth vectors.
 
 The default catalogue is optimized for minimum-cost selection. It may omit
 strictly dominated rules and collapse alpha-renamed spellings while retaining
