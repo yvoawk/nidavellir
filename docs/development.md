@@ -43,9 +43,14 @@ Changes to the compiler must preserve all of the following:
   positive coverage, and all-negative safety.
 - A timeout, interruption, UNKNOWN result, or resource limit is never reported
   as UNSAT or a completed catalogue.
-- A verified feasible hypothesis is not described as optimal without exhausted
-  compilation and selection evidence.
+- A verified feasible hypothesis is not described as optimal without either
+  complete catalogue/selection evidence or exhausted UNSAT of the original
+  finite language below its verified cost.
 - Program-bound pruning keeps the equality case and uses only verified bounds.
+- Dynamic bounds never increase, preserve optimum variants, and publish
+  completed incumbent verification before a subsequent resource-limit check.
+- Direct proof retains every legal strictly cheaper program in its abstraction;
+  SAT proposals require full semantic validation and UNKNOWN never proves UNSAT.
 - Atomic literal masks are upper bounds for conjunctions, not proofs of a joint
   witness.
 - Unlabelled target atoms remain unconstrained.

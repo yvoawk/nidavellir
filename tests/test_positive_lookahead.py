@@ -266,7 +266,8 @@ class PositiveLookaheadTests(unittest.TestCase):
             task.write_examples(inputs / 'examples.lp')
             costs = []
             for disabled in (False, True):
-                options = ['--compiler-backend', 'relational', '--target-mode', 'separate']
+                options = ['--compiler-backend', 'relational', '--target-mode', 'separate',
+                           '--proof-strategy', 'catalogue']
                 if disabled:
                     options.append('--no-positive-lookahead')
                 process, output, status = cli_fixtures.ExtendedCLITests.invoke(

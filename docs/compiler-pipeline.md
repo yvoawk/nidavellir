@@ -25,6 +25,12 @@ these subproblems are independent and their minimum costs are additive.
 unchanged in both modes; only head enumeration and labels are restricted in a
 single-target child.
 
+`--target-signature predicate/arity` explicitly selects one declared target and
+all its head templates before learning. The complete original rule-level bias
+is retained. Empty-positive target certificates use the validated absence of
+targets from the fixed BK, avoiding repeated BK grounding for unused declared
+signatures.
+
 ## 3. Analyze the bias and choose a compiler
 
 Bias analysis derives legal-body existence, required guards, capacity limits,
@@ -38,8 +44,11 @@ choice are stored in `planning.json`.
 The ground prefix filter also handles conjunctions of unit-weight cardinality
 conditions, including a used variable requiring one of several binders. It
 rejects a prefix only if an integrity constraint must be violated. An accepted
-prefix need not have a legal completion: complete candidates still pass the
-exact ASP checker. Unsupported ground definitions retain the solver fallback.
+prefix need not have a legal completion: complete candidates still pass an
+exact legality check. Supported grounded bias programs are now evaluated by a
+certified Boolean evaluator with stratified auxiliary definitions; compatible
+legal completion witnesses are reused. Unsupported constructs retain the ASP
+solver fallback. These exact checks are separate from necessary prefix filters.
 
 ## 4. Search for a feasible upper bound
 
@@ -84,7 +93,38 @@ Atomic masks are only upper bounds for conjunctions: two literals can each
 match a positive label through incompatible hidden bindings. Exact joint
 queries are therefore required before any candidate is published.
 
-## 6. Generate and validate candidate rules
+## 6. Choose direct proof or candidate compilation
+
+### Direct program proof when a verified incumbent is available
+
+For strict relational runs requesting one representative optimum with the
+internal optimizer and no ILASP verification, `--proof-strategy auto` selects
+direct proof. A verified incumbent of cost `U` supplies the question:
+
+```text
+Does a legal program H satisfy every hard label with cost(H) < U?
+```
+
+The finite program abstraction retains the actual grounded bias. Exact
+positive-failure evidence and negative witnesses exclude invalid proposals;
+independent original-BK verification certifies every accepted improvement.
+An improvement lowers `U`. Exhausted UNSAT proves the incumbent optimal.
+A timeout retains it as feasible; UNKNOWN never establishes optimality and is
+reported as an error. `program_proof.json` records this
+evidence, and `solver.json` identifies `backend: program_cegis` with
+`catalogue_complete: false`.
+
+Direct proof uses `--compile-seconds`, including any compilation performed to
+obtain an incumbent. It then proceeds to final verification and publication;
+catalogue selection and enumeration are not part of this route.
+
+### Candidate compilation
+
+`--proof-strategy catalogue` forces this route. Automatic execution also keeps
+it for bitmask compilation, partial coverage, optimum enumeration, variant
+expansion, and ILASP selection or verification. `--proof-strategy cegis` rejects
+incompatible requests. If no verified incumbent is available, compilation can
+first discover one or finish the catalogue to decide feasibility.
 
 For every compatible head, the compiler explores bodies within `max_body` while
 respecting proved guards and bias constraints. Search can prune a prefix using:
@@ -101,10 +141,21 @@ number of selected body literals. Equivalent coverage/cost signatures are
 compressed without discarding structural ties needed for requested variant
 reconstruction.
 
+During strict relational compilation, `--dynamic-program-bounds` is enabled by
+default. Cheap covers of newly discovered exact rules are independently
+verified before lowering global or per-target cost bounds. Limits are re-read
+inside traversal, equality is preserved, and an improved verified incumbent
+survives a later resource limit. This mechanism is disabled with
+`--no-dynamic-program-bounds` and is inactive in partial-coverage mode.
+When direct proof is eligible, its first new full incumbent triggers an
+immediate transfer using the remaining compilation budget. Otherwise the
+catalogue retains every component needed for optimal complete programs under
+the final verified bounds.
+
 The result is `catalogue.json`, plus an internal Clingo set-cover program and an
 ILASP selection task.
 
-## 7. Select a minimum-cost program
+## 7. Select a minimum-cost program from the catalogue
 
 With `--allow-partial-coverage`, first take the union of all safe candidate
 positive masks, then minimize cost over covers of that union. The union is
@@ -146,3 +197,12 @@ Machine-readable state is printed as JSON on standard output and mirrored in
 - `2`: invalid input or execution error;
 - `3`: a valid but nonterminal outcome such as feasible, incomplete,
   verification-incomplete, enumeration-incomplete, or interrupted.
+
+## Unbounded phase execution
+
+`--no-time-limit` requires explicit `--compiler-backend relational` and rejects
+optimum enumeration or variant expansion. Oracle, compilation, direct proof,
+and selection budgets become `None`, which means no deadline. Initial bound
+discovery still respects finite `--bound-seconds`; it is an optional incumbent
+heuristic and its timeout does not stop the following search. Resource limits
+other than deadlines and external interruptions remain possible.

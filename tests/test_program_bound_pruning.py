@@ -122,7 +122,8 @@ class ProgramBoundPruningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             for name, extra, enabled in [('bound', (), True), ('unbounded', ('--bound-seconds', '0'), False)]:
                 process, output, status = cli_fixtures.ExtendedCLITests.invoke(
-                    self, folder, name, '--compiler-backend', 'relational', *extra)
+                    self, folder, name, '--compiler-backend', 'relational',
+                    '--proof-strategy', 'catalogue', '--no-dynamic-program-bounds', *extra)
                 self.assertEqual(process.returncode, 0, process.stderr + process.stdout)
                 self.assertEqual(status['optimal_cost'], 4)
                 stats = json.loads((output / 'catalogue.json').read_text())['stats']

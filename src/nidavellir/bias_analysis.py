@@ -43,6 +43,219 @@ class _GroundObserver:
 
 
 @dataclass(frozen=True)
+class _GroundLegality:
+    """Exact least-model evaluation of a certified ground stratified program.
+
+    Body atoms are freely supported choices, head atoms are fixed by the query,
+    and every remaining rule is normal and stratified. Positive recursion is
+    evaluated to its least fixed point. Auxiliary choices, disjunction, negative
+    cycles and non-unit aggregates retain the original Clingo query instead.
+    Unlike PrefixFilter, this certificate proves complete-body legality.
+    """
+    components: tuple
+    constraints: tuple
+    forced: int
+    absent: int
+
+    @staticmethod
+    def _holds(actual, rule):
+        kind, positive, negative, lower = rule
+        if kind == "and":
+            return actual & positive == positive and not actual & negative
+        return ((actual & positive).bit_count()
+                + (negative & ~actual).bit_count()) >= lower
+
+    def accepts(self, selected):
+        if selected & self.absent or selected & self.forced != self.forced:
+            return False
+        actual = selected
+        for cyclic, alternatives, conjunctions in self.components:
+            while True:
+                before = actual
+                for head, inputs in alternatives:
+                    if actual & inputs:
+                        actual |= head
+                for head, rule in conjunctions:
+                    if not actual & head and self._holds(actual, rule):
+                        actual |= head
+                if not cyclic or before == actual:
+                    break
+        return not any(self._holds(actual, rule) for rule in self.constraints)
+
+
+def _ground_legality(observer, body_atoms, fixed_atoms):
+    """Certify and compile a ground program, without recognizing source idioms."""
+    if observer.external_atoms:
+        return None
+    inputs = {atom: i for i, atom in enumerate(body_atoms) if atom is not None}
+    if len(inputs) != sum(atom is not None for atom in body_atoms):
+        # Ground aliases require equality constraints between input positions.
+        return None
+    context = set(inputs) | set(fixed_atoms)
+    static, normal, weighted, choices, forced = dict(fixed_atoms), [], [], [], set()
+    context_facts = set()
+    source_facts = {head[0] for choice, head, body in observer.rules
+                    if not choice and len(head) == 1 and not body}
+    defined = set(context)
+    for choice, head, body in observer.rules:
+        if choice:
+            if any(atom not in context for atom in head):
+                return None
+            choices.append((head, body))
+        elif len(head) > 1:
+            return None
+        elif head and head[0] in context:
+            # Conditional definitions of selectable atoms can change support.
+            if body:
+                return None
+            if head[0] in inputs:
+                forced.add(head[0])
+            elif not static[head[0]]:
+                return None
+            static[head[0]] = True
+            context_facts.add(head[0])
+        else:
+            normal.append((head[0] if head else None, body))
+        defined.update(head)
+    for choice, head, lower, body in observer.weights:
+        if choice or len(head) > 1 or (head and head[0] in context):
+            return None
+        if any(weight != 1 for _, weight in body):
+            return None
+        weighted.append((head[0] if head else None, lower, tuple(atom for atom, _ in body)))
+        defined.update(head)
+    mentioned = {abs(atom) for _, body in normal for atom in body}
+    mentioned.update(abs(atom) for _, _, body in weighted for atom in body)
+    mentioned.update(abs(atom) for _, body in choices for atom in body)
+    static.update({atom: False for atom in mentioned - defined})
+
+    def simplify(body):
+        remaining = []
+        for atom in body:
+            if abs(atom) in static:
+                if static[abs(atom)] != (atom > 0):
+                    return None
+            else:
+                remaining.append(atom)
+        return tuple(remaining)
+
+    # Ground facts and their consequences need no work in subsequent queries.
+    while True:
+        changed, next_normal, next_weighted = False, [], []
+        for head, body in normal:
+            if head in static and static[head]:
+                continue
+            body = simplify(body)
+            if body is None:
+                continue
+            if head is not None and not body:
+                static[head] = True
+                changed = True
+            else:
+                next_normal.append((head, body))
+        for head, lower, body in weighted:
+            if head in static and static[head]:
+                continue
+            remaining = []
+            for atom in body:
+                if abs(atom) in static:
+                    lower -= static[abs(atom)] == (atom > 0)
+                else:
+                    remaining.append(atom)
+            if lower > len(remaining):
+                continue
+            if head is not None and lower <= 0:
+                static[head] = True
+                changed = True
+            else:
+                next_weighted.append((head, lower, tuple(remaining)))
+        normal, weighted = next_normal, next_weighted
+        if not changed:
+            break
+    free = set(context_facts)
+    for head, body in choices:
+        # Use original unconditional support, never facts inferred after fixing
+        # the head. Otherwise {head(h)} :- head(h) could justify itself.
+        if all(atom > 0 and atom in source_facts for atom in body):
+            free.update(head)
+    if not (set(inputs) | {atom for atom, value in fixed_atoms.items() if value}) <= free:
+        return None
+
+    rules = [(head, "and", body, None) for head, body in normal]
+    rules.extend((head, "count", body, lower) for head, lower, body in weighted)
+    # Grounder duplicates would otherwise count twice after bit-mask lowering.
+    if any(kind == "count" and len(body) != len(set(body)) for _, kind, body, _ in rules):
+        return None
+    definitions, needed = {}, set()
+    for head, kind, body, lower in rules:
+        if head is None:
+            needed.update(abs(atom) for atom in body if abs(atom) not in context)
+        else:
+            definitions.setdefault(head, []).append((kind, body, lower))
+    # Even an auxiliary disconnected from every constraint can destroy stable
+    # model existence through an odd negative cycle. Certify the whole program.
+    needed.update(definitions)
+    pending = list(needed)
+    while pending:
+        for _, body, _ in definitions.get(pending.pop(), ()):
+            for atom in body:
+                atom = abs(atom)
+                if atom not in context and atom not in needed:
+                    needed.add(atom)
+                    pending.append(atom)
+    # Tarjan components arrive with dependencies first. A negative edge within
+    # one component is exactly the case where this stratification proof fails.
+    number, low, stack, stacked, components = {}, {}, [], set(), []
+    def visit(atom):
+        number[atom] = low[atom] = len(number)
+        stack.append(atom)
+        stacked.add(atom)
+        for _, body, _ in definitions.get(atom, ()):
+            for dependency in map(abs, body):
+                if dependency not in needed:
+                    continue
+                if dependency not in number:
+                    visit(dependency)
+                    low[atom] = min(low[atom], low[dependency])
+                elif dependency in stacked:
+                    low[atom] = min(low[atom], number[dependency])
+        if low[atom] == number[atom]:
+            component = set()
+            while True:
+                other = stack.pop()
+                stacked.remove(other)
+                component.add(other)
+                if other == atom:
+                    break
+            components.append(component)
+    for atom in sorted(needed):
+        if atom not in number:
+            visit(atom)
+    atom_bits = {atom: 1 << i for atom, i in inputs.items()}
+    atom_bits.update({atom: 1 << (len(body_atoms) + i) for i, atom in enumerate(sorted(needed))})
+    def encode(kind, body, lower):
+        return (kind, sum(atom_bits[atom] for atom in set(body) if atom > 0),
+                sum(atom_bits[-atom] for atom in set(body) if atom < 0), lower)
+    compiled = []
+    for component in components:
+        alternatives, conjunctions, cyclic = {}, [], len(component) > 1
+        for head in sorted(component):
+            for kind, body, lower in definitions.get(head, ()):
+                if any(atom < 0 and -atom in component for atom in body):
+                    return None
+                cyclic |= head in body
+                if kind == "and" and len(body) == 1 and body[0] > 0:
+                    alternatives[atom_bits[head]] = alternatives.get(atom_bits[head], 0) | atom_bits[body[0]]
+                else:
+                    conjunctions.append((atom_bits[head], encode(kind, body, lower)))
+        compiled.append((cyclic, tuple(alternatives.items()), tuple(conjunctions)))
+    constraints = tuple(encode(kind, body, lower) for head, kind, body, lower in rules if head is None)
+    return _GroundLegality(tuple(compiled), constraints,
+                           sum(1 << inputs[atom] for atom in forced),
+                           sum(1 << i for i, atom in enumerate(body_atoms) if atom is None))
+
+
+@dataclass(frozen=True)
 class PrefixFilter:
     """Necessary ground constraints evaluated with partial body assignments.
 
@@ -361,8 +574,12 @@ class _HeadSolver:
         self.ground_observer = _GroundObserver()
         self.control.register_observer(self.ground_observer)
         self.stats = {"solves": 0, "models": 0, "unsat_queries": 0, "solve_seconds": 0.0,
-                      "legality_queries": 0, "completion_queries": 0, "cache_hits": 0}
+                      "legality_queries": 0, "completion_queries": 0, "cache_hits": 0,
+                      "compiled_legality_queries": 0, "compiled_legality_hits": 0,
+                      "completion_witness_hits": 0}
         self.cache = OrderedDict()
+        self.compiled_legality = None
+        self.witnesses = OrderedDict()
         self.cores = None
         if core_pruning:
             from .bias_cores import BiasCores
@@ -459,6 +676,11 @@ class _HeadSolver:
         if omit_some and set(omit_some) <= selected:
             raise AssertionError("Bias witness does not refute a possible guard")
         self.stats["models"] += 1
+        bits = sum(1 << i for i in selected)
+        self.witnesses[bits] = None
+        self.witnesses.move_to_end(bits)
+        if len(self.witnesses) > 64:
+            self.witnesses.popitem(last=False)
         return selected
 
     def completion(self, included, excluded, check=None):
@@ -469,7 +691,32 @@ class _HeadSolver:
             self.stats["cache_hits"] += 1
             self.cache.move_to_end(key)
             return self.cache[key]
-        answer = self.find(*key, check=check) is not None
+        included, excluded = key
+        count = len(self.body_atoms)
+        if (any(type(i) is not int or i < 0 or i >= count for i in included | excluded)
+                or included & excluded or len(included) > self.task.max_body):
+            return False
+        selected, forbidden = sum(1 << i for i in included), sum(1 << i for i in excluded)
+        answer = None
+        if self.compiled_legality is not None:
+            self.stats["compiled_legality_queries"] += 1
+            if self.compiled_legality.accepts(selected):
+                # This exact full assignment is a witness for the prefix too.
+                answer = True
+            elif len(included | excluded) == count:
+                answer = False
+            if answer is not None:
+                self.stats["compiled_legality_hits"] += 1
+        if answer is None:
+            for witness in reversed(self.witnesses):
+                if witness & selected == selected and not witness & forbidden:
+                    self.stats["completion_witness_hits"] += 1
+                    answer = True
+                    break
+        if answer is None:
+            answer = self.find(*key, check=check) is not None
+        if check:
+            check()
         self.cache[key] = answer
         self.cache.move_to_end(key)
         if len(self.cache) > 4096:
@@ -541,7 +788,7 @@ def _private_variables(task, head, guards, unusable):
     return {slot: indices[0] for slot, indices in sorted(occurrences.items()) if len(indices) == 1}
 
 
-def analyze(task: Task, *, seconds: float = 30,
+def analyze(task: Task, *, seconds: float | None = 30,
             check: Callable[[], None] | None = None, core_pruning=None) -> BiasAnalysis:
     """Return complete guard proofs and reusable exact legality checkers.
 
@@ -556,14 +803,14 @@ def analyze(task: Task, *, seconds: float = 30,
     core_pruning=None follows the task's compiler runtime choice (off unless
     configured); an explicit boolean overrides it for this fresh analysis.
     """
-    if not isfinite(seconds) or seconds < 0:
-        raise ValueError("Bias analysis requires nonnegative finite seconds")
+    if seconds is not None and (not isfinite(seconds) or seconds < 0):
+        raise ValueError("Bias analysis requires nonnegative finite seconds or None")
     if core_pruning is None:
         core_pruning = getattr(task, '_bias_core_pruning', False)
     if type(core_pruning) is not bool:
         raise ValueError("core_pruning must be a boolean")
     started = time.monotonic()
-    deadline = started + seconds
+    deadline = float("inf") if seconds is None else started + seconds
     stats = {"method": "stable_model_intersection_and_unsat_proof",
              "head_count": len(task.heads), "literal_count": len(task.literals),
              "solves": 0, "models": 0, "unsat_queries": 0,
@@ -619,6 +866,9 @@ def analyze(task: Task, *, seconds: float = 30,
         for index, guards in enumerate(proven):
             if index not in unusable and any(not (proven[g] - {index}) <= guards for g in guards):
                 raise AssertionError("Proven guard relation is not transitively closed")
+        solver.compiled_legality = _ground_legality(solver.ground_observer, solver.body_atoms,
+                                                   solver.head_atoms)
+        solver.stats["compiled_legality_supported"] = solver.compiled_legality is not None
         results[head] = HeadAnalysis(head, tuple(proven), frozenset(unusable), first is not None,
                                      _private_variables(task, head, proven, unusable), solver,
                                      _prefix_filter(solver.ground_observer, solver.body_atoms, proven,

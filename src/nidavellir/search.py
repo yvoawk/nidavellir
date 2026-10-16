@@ -99,7 +99,7 @@ class Preprocessing:
 def _analysis(task, check, seconds):
     result = getattr(task, "_bias_analysis", None)
     if result is None:
-        result = analyze(task, seconds=max(0, seconds), check=check)
+        result = analyze(task, seconds=None if seconds is None else max(0, seconds), check=check)
         task._bias_analysis = result
     return result
 
@@ -775,19 +775,19 @@ def compile_catalogue(task, indices, *, bound=None, seconds=300, progress=None,
     Pruning preserves all global optima, including ties, under those costs;
     some partial signatures unusable at a target optimum may be omitted.
     """
-    if not isfinite(seconds) or seconds < 0:
-        raise ValueError("Compilation seconds must be finite and nonnegative")
+    if seconds is not None and (not isfinite(seconds) or seconds < 0):
+        raise ValueError("Compilation seconds must be None or finite and nonnegative")
     if variants not in {"exhaustive", "targeted", "representative"}:
         raise ValueError("variants must be exhaustive, targeted, or representative")
     from .target_bounds import validate_target_costs, positive_scopes, key_text
     target_costs = validate_target_costs(task, target_bounds)
     started = time.monotonic()
-    deadline = started + seconds
+    deadline = float("inf") if seconds is None else started + seconds
     def check():
         if time.monotonic() >= deadline:
             raise ResourceLimit("Compilation time budget reached", dict(traversal.stats) if traversal else {})
     traversal = None
-    traversal = _Traversal(task, indices, check, lambda: deadline - time.monotonic(), order=order,
+    traversal = _Traversal(task, indices, check, lambda: None if seconds is None else deadline - time.monotonic(), order=order,
                            preprocess=preprocessing, legal_pruning=legal_pruning)
     maximum = max(0, min(task.max_body, bound - 1)) if bound is not None else task.max_body
     traversal.stats["effective_body_limit"] = maximum

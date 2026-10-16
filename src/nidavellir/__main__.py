@@ -27,6 +27,44 @@ from .terminal_progress import TerminalProgress
 from .json_stream import JsonArray, write_json
 
 
+class _ProofFinished(Exception):
+    """Internal control flow after publishing a direct program-proof result."""
+
+
+class _IncumbentReady(Exception):
+    """A verified dynamic cover permits switching from enumeration to proof."""
+
+
+def recover_target_cover(task, cover, bound):
+    """Compose complete verified target certificates after worker timeout.
+
+    A missing global worker checkpoint must not discard a cover whose target
+    certificates already cover every supplied positive. Recheck the combined
+    rules against the original BK before promoting the global incumbent.
+    """
+    if cover is not None or not bound.get("target_bounds"):
+        return cover, bound
+    from .target_bounds import costs_from_certificates, positive_scopes, key_text
+    certificates = bound["target_bounds"]
+    costs_from_certificates(task, certificates)
+    scopes = positive_scopes(task)
+    if any(mask and key_text(key) not in certificates for key, mask in scopes.items()):
+        return cover, bound
+    recovered = []
+    for key, mask in scopes.items():
+        if mask:
+            recovered.extend(dict(row, coverage=int(row["coverage"], 16))
+                             for row in certificates[key_text(key)]["cover"])
+    verification = verify_rules(task, [row["rule"] for row in recovered])
+    if not verification["matched"]:
+        raise AssertionError("Composed target incumbents failed independent verification")
+    updated = dict(bound, status="verified", discovery_status=bound["status"],
+                   cost=sum(row["cost"] for row in recovered),
+                   rules=[row["rule"] for row in recovered], verification=verification,
+                   incumbent_source="verified_target_certificates")
+    return recovered, updated
+
+
 def file_digest(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -168,6 +206,10 @@ def parser():
     for flag in ("background", "examples", "bias", "output"):
         p.add_argument("--" + flag, type=Path, required=True)
     p.add_argument("--optimizer", choices=("internal", "ilasp"), default="internal")
+    p.add_argument("--proof-strategy", choices=("auto", "catalogue", "cegis"), default="auto",
+                   help="auto proves strict relational representative optima by searching cheaper programs; catalogue retains the full selection pipeline")
+    p.add_argument("--dynamic-program-bounds", action=argparse.BooleanOptionalAction, default=True,
+                   help="revise verified cost bounds from exact rules discovered during strict relational compilation")
     p.add_argument("--allow-partial-coverage", action="store_true",
                    help="maximize covered positives, then minimize rule cost; negatives stay strict (default: require every positive)")
     p.add_argument("--internal-opt-strategy", choices=("usc,oll", "bb,lin"), default="usc,oll",
@@ -214,7 +256,7 @@ def parser():
                    help="Skip exact relational prefix feasibility queries; final candidate legality stays exact")
     p.add_argument("--target-mode", choices=("separate", "grouped"), default="separate",
                    help="Separate sequential target calls (default), or one grouped compilation/selection")
-    p.add_argument("--target-signature", help=argparse.SUPPRESS)
+    p.add_argument("--target-signature", help="learn one declared predicate/arity while retaining its complete rule-level bias")
     p.add_argument("--per-target-bounds", action=argparse.BooleanOptionalAction, default=True,
                    help="Use verified target bounds in bitmask or relational compilation (default); budget is per call")
     p.add_argument("--max-programs", type=int)
@@ -233,6 +275,8 @@ def parser():
                    help="maximum truth-vector classes for the projected oracle (default: 1000000)")
     p.add_argument("--max-witnesses", type=int, default=1_000_000,
                    help="maximum raw witnesses for --oracle-backend cartesian only (default: 1000000)")
+    p.add_argument("--no-time-limit", action="store_true",
+                   help="remove relational oracle, compilation, proof and selection deadlines; optional initial bound discovery retains its heuristic budget")
     p.add_argument("--no-verbose", dest="verbose", action="store_false", default=True,
                    help="disable the default compact progress on stderr")
     return p
@@ -252,6 +296,9 @@ def run(args):
     coverage_report = None
     cover = None
     task = None
+    bound = {"status": "disabled", "cost": None}
+    proof_enabled = False
+    compilation_deadline = None
     terminal = TerminalProgress(args.verbose, target=args.target_signature)
     terminal.start(started)
 
@@ -287,6 +334,55 @@ def run(args):
         update(hypothesis_cost=cost, optimal_cost=cost if optimal else None,
                learned_rule_count=len(rules), semantic_verification=True)
 
+    def accept_dynamic_incumbent(certificate):
+        nonlocal cover, bound
+        rows = [dict(row, coverage=int(row["coverage"], 16)
+                     if isinstance(row["coverage"], str) else row["coverage"])
+                for row in certificate["cover"]]
+        if cover is not None and sum(row["cost"] for row in cover) <= certificate["cost"]:
+            return
+        cover = rows
+        bound = dict(bound, status="verified", cost=certificate["cost"],
+                     rules=certificate["rules"], verification=certificate["verification"],
+                     incumbent_source="dynamic_compilation")
+        write_json(output / "dynamic_incumbent.json", certificate)
+        write_json(output / "bound.json", bound)
+        if proof_enabled:
+            raise _IncumbentReady()
+
+    def finish_with_program_proof(oracle):
+        nonlocal cover, bound
+        from .program_proof import prove_program_optimality
+        update(stage="program_proof", proof_strategy="cegis")
+        remaining = (None if compilation_deadline is None else
+                     max(0, compilation_deadline - time.monotonic()))
+        cover, proof = prove_program_optimality(task, cover, seconds=remaining,
+                                              oracle=oracle, progress=trace)
+        write_json(output / "program_proof.json", proof)
+        cost = sum(row["cost"] for row in cover)
+        optimal = proof.get("optimality_proven") is True
+        bound = dict(bound, cost=cost, rules=[row["rule"] for row in cover])
+        emit_rules([row["rule"] for row in cover], cost, optimal)
+        bound.update(status="verified", verification=json.loads((output / "verification.json").read_text()))
+        write_json(output / "bound.json", bound)
+        write_json(output / "solver.json", {
+            "backend": "program_cegis", "status": "complete" if optimal else "timeout",
+            "cost": cost, "optimum_cost": cost if optimal else None,
+            "rules": [row["rule"] for row in cover], "selected": [],
+            "scope": ("original finite rule language; proved absence of strictly cheaper programs" if optimal
+                      else "original finite rule language; strict-improvement proof unfinished"),
+            "catalogue_complete": False, "proof_file": "program_proof.json",
+            "optimality_proven": optimal})
+        update(status="complete" if optimal else "feasible", stage="finished" if optimal else "program_proof",
+               optimality_source=("nonnegative_additive_rule_cost" if cost == 0 else
+                                  "strict_improvement_unsat") if optimal else None,
+               catalogue_complete=False, enumeration_complete=not args.enumerate_optima,
+               variant_expansion_complete=not args.expand_variants,
+               ilasp_verification="not_requested")
+        if not optimal:
+            update(reason=proof.get("reason", "Program proof deadline reached; verified incumbent retained"))
+        raise _ProofFinished()
+
     update()
     try:
         task = Task.load(args.background, args.examples, args.bias)
@@ -318,7 +414,7 @@ def run(args):
         update(stage="planning", input_seconds=time.monotonic() - started)
         planning_started = time.monotonic()
         def planning_check():
-            if time.monotonic() >= planning_started + args.oracle_seconds:
+            if args.oracle_seconds is not None and time.monotonic() >= planning_started + args.oracle_seconds:
                 raise ResourceLimit("Backend planning time budget reached")
         if args.compiler_backend == "auto":
             from .planning import choose_backend
@@ -335,6 +431,13 @@ def run(args):
             strategy = "off"
         if strategy == "auto":
             strategy = "bitmask" if compiler_backend == "bitmask" else "relational"
+        eligible = (compiler_backend == "relational" and not partial
+                    and not args.enumerate_optima and not args.expand_variants
+                    and args.optimizer == "internal" and not args.verify_ilasp)
+        if args.proof_strategy == "cegis" and not eligible:
+            raise TaskError("CEGIS proof requires strict relational representative execution with the internal optimizer and no ILASP verification")
+        proof_enabled = eligible and args.proof_strategy != "catalogue"
+        update(proof_strategy="cegis" if proof_enabled else "catalogue")
         if compiler_backend == "relational" and strategy == "bitmask":
             raise TaskError("--bound-strategy bitmask requires --compiler-backend bitmask")
         if args.resume_bound and strategy != "relational":
@@ -355,6 +458,8 @@ def run(args):
             cover, bound = bound_in_subprocess(task, [], args.bound_seconds, snap, strategy="relational",
                 fingerprint=fingerprint, checkpoint_path=output / "bound_checkpoint.json", resume_path=args.resume_bound,
                 per_target_bounds=args.per_target_bounds)
+        if not partial:
+            cover, bound = recover_target_cover(task, cover, bound)
         write_json(output / "bound.json", bound)
         if cover is not None:
             (output / "first_feasible.lp").write_text("\n".join(c["rule"] for c in cover) + "\n")
@@ -362,7 +467,7 @@ def run(args):
         indices, relational_oracle = [], None
         oracle_started = time.monotonic()
         def oracle_check():
-            if time.monotonic() >= oracle_started + args.oracle_seconds:
+            if args.oracle_seconds is not None and time.monotonic() >= oracle_started + args.oracle_seconds:
                 raise ResourceLimit("Oracle initialization time budget reached")
         if not task.positives:
             oracle_stats = {"status": "not_needed", "reason": "Empty positive set; empty program is optimal"}
@@ -432,21 +537,30 @@ def run(args):
         if cover is not None:
             (output / "first_feasible.lp").write_text("\n".join(c["rule"] for c in cover) + "\n")
         update(stage="compilation")
+        compilation_deadline = None if args.compile_seconds is None else time.monotonic() + args.compile_seconds
+        if proof_enabled and cover is not None:
+            finish_with_program_proof(relational_oracle)
         from .target_bounds import costs_from_certificates
         target_costs = (costs_from_certificates(task, bound.get("target_bounds", {}))
                         if args.per_target_bounds and not partial else None)
         if compiler_backend == "relational" and task.positives:
             from .relational_compile import compile_catalogue as compile_relational
-            candidates, compilation = compile_relational(task, relational_oracle, bound=bound["cost"],
-                seconds=args.compile_seconds, progress=trace, variants="representative",
-                alpha_collect=not args.raw_alpha_variants,
-                exact_program_bound=not args.no_exact_program_bound,
-                bound_positive_probes=args.bound_positive_probes,
-                ground_prefix_filter=not args.no_ground_prefix_filter,
-                prefix_completion=not args.no_prefix_completion,
-                target_bounds=target_costs,
-                program_bound=(cover is not None and bound.get("status") == "verified"
-                               and bound["cost"] is not None and bound["cost"] > 0))
+            try:
+                candidates, compilation = compile_relational(task, relational_oracle, bound=bound["cost"],
+                    seconds=args.compile_seconds, progress=trace, variants="representative",
+                    alpha_collect=not args.raw_alpha_variants,
+                    exact_program_bound=not args.no_exact_program_bound,
+                    bound_positive_probes=args.bound_positive_probes,
+                    ground_prefix_filter=not args.no_ground_prefix_filter,
+                    prefix_completion=not args.no_prefix_completion,
+                    target_bounds=target_costs,
+                    dynamic_program_bound=args.dynamic_program_bounds and not partial,
+                    on_incumbent=(accept_dynamic_incumbent
+                                  if args.dynamic_program_bounds and not partial else None),
+                    program_bound=(cover is not None and bound.get("status") == "verified"
+                                   and bound["cost"] is not None and bound["cost"] > 0))
+            except _IncumbentReady:
+                finish_with_program_proof(relational_oracle)
         else:
             candidates, compilation = compile_catalogue(task, indices, bound=bound["cost"],
                 seconds=args.compile_seconds, progress=trace, variants="representative",
@@ -470,7 +584,7 @@ def run(args):
                                                     allow_partial_coverage=partial))
         (output / "compiled_ilasp.las").write_text(selection_task(candidates, len(task.positives),
                                                  allow_partial_coverage=partial))
-        update(stage="selection")
+        update(stage="selection", proof_strategy="catalogue", catalogue_complete=True)
         selected = solve(candidates, len(task.positives), backend=args.optimizer,
                          ilasp_binary=args.ilasp_binary, timeout=args.solver_seconds,
                          internal_opt_strategy=args.internal_opt_strategy,
@@ -556,8 +670,14 @@ def run(args):
                 update(status="incomplete", reason="Selection time budget reached")
         else:
             update(status="error", reason=selected.get("error") or selected.get("stderr") or "Solver error")
+    except _ProofFinished:
+        pass
     except ResourceLimit as error:
         write_json(output / "resource_limit.json", {"stage": status["stage"], "reason": str(error), "stats": error.stats})
+        certificate = error.stats.get("dynamic_incumbent")
+        if certificate is not None and not partial:
+            proof_enabled = False  # No search time remains after this deadline.
+            accept_dynamic_incumbent(certificate)
         if cover is not None and not partial:
             emit_rules([c["rule"] for c in cover], sum(c["cost"] for c in cover), False)
             update(status="feasible", reason=str(error))
@@ -570,14 +690,18 @@ def run(args):
     finally:
         update()
         terminal.close()
-        lines = ["# Rule compiler execution", "", f"Status: **{status['status']}**.",
+        lines = ["# Nidavellir execution", "", f"Status: **{status['status']}**.",
                  f"Stage: `{status['stage']}`. Elapsed: {status['elapsed_seconds']:.3f} s.",
                  f"Oracle backend: `{status['backend']}`.",
+                 f"Proof strategy: `{status.get('proof_strategy', 'not_started')}`.",
                  f"Proven optimum: {status['optimal_cost']}.", "",
                  ("Positives are maximized before minimizing rule cost; supplied negatives remain hard."
                   if partial else "Inputs are ground hard labels. Unlabelled outputs are unconstrained."),
                  "ILASP verification, when requested, checks selection from the compiled catalogue.",
                  "`verification.json` checks learned clauses independently in the original BK."]
+        if (output / "program_proof.json").exists():
+            lines += ["", "`program_proof.json` records strict-improvement search and its proof state; "
+                      "a complete catalogue is not claimed."]
         if coverage_report is not None:
             lines += ["", f"Maximum positive coverage: {coverage_report['maximum_covered_positives']}/{coverage_report['positive_count']}.",
                       f"Uncoverable positives in this language: {coverage_report['minimum_missed_positives']}.",
@@ -621,6 +745,14 @@ def main():
         p.error("--verify-ilasp verifies the internal optimizer; use --optimizer internal")
     if args.allow_partial_coverage and args.resume_bound:
         p.error("--allow-partial-coverage cannot resume a strict full-cover bound")
+    if args.proof_strategy == "cegis" and (args.allow_partial_coverage or args.enumerate_optima
+            or args.expand_variants or args.optimizer != "internal" or args.verify_ilasp
+            or args.compiler_backend == "bitmask"):
+        p.error("--proof-strategy cegis requires strict relational representative optimization without ILASP")
+    if args.no_time_limit:
+        if args.compiler_backend != "relational" or args.enumerate_optima or args.expand_variants:
+            p.error("--no-time-limit currently requires relational representative execution")
+        args.oracle_seconds = args.compile_seconds = args.solver_seconds = None
     if args.output.exists():
         p.error("output directory already exists; use a new directory")
     if args.target_mode == "separate" and not args.target_signature:

@@ -11,9 +11,9 @@ covers every supplied positive and minimizes:
 sum over selected rules of (1 + number of body literals)
 ```
 
-Overlapping coverage is allowed and often necessary. The optimizer solves a
-multi-rule weighted set-cover problem; it does not assume one rule per target or
-one rule per example.
+Overlapping coverage is allowed and often necessary. The objective is a
+multi-rule weighted set-cover problem; neither proof strategy assumes one rule
+per target or one rule per example.
 
 ### Opt-in partial coverage
 
@@ -33,8 +33,8 @@ mapping to the original positive positions. Input labels are never rewritten.
 Safe compiler reductions still apply: replacing a rule by a strictly cheaper
 negative-safe rule covering a superset cannot reduce coverage and improves cost
 whenever needed. Equivalent masks preserve their minimum costs and tied
-variants. Full-cover heuristic bounds are disabled; compilation therefore
-retains every signature needed to certify maximum coverage and its minimum
+variants. Full-cover heuristic and dynamic bounds are disabled; compilation
+therefore retains every signature needed to certify maximum coverage and its minimum
 cost. Target-independent maxima and subsequent minimum costs add across
 signatures, so separate execution is equivalent to grouped execution.
 
@@ -50,14 +50,14 @@ Python selector's coverage certificate concerns only its supplied catalogue.
 A top-level `complete` result guarantees, relative to the accepted input
 contract:
 
-1. The required finite candidate compilation finished under all enabled sound
-   reductions.
-2. The optimizer completed and proved the reported minimum cost over that
-   catalogue.
-3. The catalogue reductions preserve minimum-cost programs in the finite legal
-   grammar.
-4. The emitted hypothesis was independently evaluated in the original fixed BK.
-5. No supplied negative is predicted. In default strict mode every supplied
+1. Optimality was established by one of two exact routes: complete finite
+   catalogue compilation followed by completed selection, or exhausted UNSAT
+   for every program strictly cheaper than an independently verified incumbent.
+2. Catalogue reductions preserve minimum-cost programs, and direct proof's
+   finite abstraction includes every legal strictly cheaper program. Direct
+   proof is restricted to the strict full-coverage objective.
+3. The emitted hypothesis was independently evaluated in the original fixed BK.
+4. No supplied negative is predicted. In default strict mode every supplied
    positive is predicted; in partial mode the reported maximum number of
    positives is predicted and cost is minimal among programs attaining it.
 
@@ -65,12 +65,17 @@ This is a task-relative proof. It does not establish that the BK is a faithful
 model of an external world, that missing labels are negative, or that a better
 rule exists outside the supplied bias.
 
+On the direct route, `program_proof.json.optimality_proven` records the proof and
+`status.json.catalogue_complete` is false. These fields describe different
+claims. Direct proof yields a representative optimum, not complete optimum or
+variant enumeration.
+
 ## Feasible, incomplete, and unsatisfiable
 
 These states are deliberately distinct:
 
 - `feasible`: a hypothesis has passed independent semantic verification, but
-  compilation or selection did not prove it optimal.
+  compilation, selection, or direct program search did not prove it optimal.
 - `incomplete`: a required phase exhausted a time, witness, class, or other
   resource budget without a verified hypothesis.
 - `unsatisfiable`: complete candidate compilation and exhausted selection prove
@@ -130,6 +135,25 @@ greater than `U`. Equality is preserved. Exact positive probes can disprove that
 an expensive rule covers all positives; successful probes never substitute for
 full coverage verification.
 
+Dynamic compilation bounds use the same non-strict `cost <= U` scope. Exact
+discovered rules may propose a covering program; only independent evaluation in
+the original BK can certify a new bound. Bounds never increase. Per-target
+certificates keep every overlapping head template of that signature together.
+Previously retained components that cannot fit the final verified bound may be
+retired. These reductions preserve optimal complete programs and their tied
+variants, but do not preserve every suboptimal catalogue signature. The Python
+API therefore requires explicit `dynamic_program_bound=True`; the CLI enables
+it only for strict relational compilation. `--no-dynamic-program-bounds`
+disables online revisions without disabling the initial bound worker.
+
+Direct proof uses a different search scope: given a verified feasible cost
+`U`, it asks whether a legal program satisfying every supplied hard label has
+`cost < U`. A verified cheaper answer lowers `U` and continues the same question
+under the tighter constraint. Only exhausted UNSAT proves the current `U`
+optimal. SAT proposals, failed joins, elapsed time, and UNKNOWN do not establish
+optimality. The incumbent remains available on timeout; complete catalogue
+construction is unnecessary for this strict-improvement certificate.
+
 Optional positive-core and bias-core pruning is disabled by default. Enabling
 it reuses only independently characterized failure evidence. Exact final checks
 remain in place.
@@ -156,7 +180,7 @@ bias.
 
 A classic ILASP workflow normally gives ILASP background knowledge, mode bias,
 and examples, allowing ILASP to generate and optimize hypotheses directly.
-Nidavellir instead:
+On Nidavellir's catalogue route, it instead:
 
 1. accepts its own explicit finite template contract;
 2. evaluates and compresses rule semantics before optimization;
@@ -167,6 +191,11 @@ Nidavellir instead:
 Consequently, Nidavellir's `bias.lp` is not a drop-in ILASP mode-declaration
 file, and `compiled_ilasp.las` is a generated selection artifact rather than the
 original learning task.
+
+The direct proof route searches programs from Nidavellir's own finite template
+language and exact grounded bias, using original-BK counterexamples to refine
+the search. It does not call ILASP and does not change the accepted input
+language into ILASP mode declarations.
 
 ## Scalability limits
 
@@ -186,3 +215,9 @@ grounding or native solver calls. Some Clingo grounding operations cannot be
 interrupted at arbitrary Python instruction boundaries. Use isolated processes,
 fresh output directories, explicit budgets, and persisted status artifacts for
 large tasks.
+
+For explicit relational runs without optimum or variant enumeration,
+`--no-time-limit` removes oracle, compilation, proof, and selection deadlines
+using `None` budgets. Initial bound discovery keeps its finite heuristic budget.
+An unbounded deadline does not predict termination time or prevent memory
+exhaustion or external interruption.

@@ -48,6 +48,20 @@ def collect_verified_target_bounds(task,pool,previous,analysis,check,*,verify_ta
     associates these certificates with its current input/engine fingerprint.
     """
     scopes=positive_scopes(task)
+    empty_keys={key for key,mask in scopes.items() if not mask and key_text(key) not in previous}
+    if empty_keys:
+        # Task.load already validated the unique fixed BK and forbids targets
+        # in it. Empty rules cannot add any target atom, irrespective of how
+        # many negatives were supplied. Check the materialized interpretation
+        # once for all empty targets too, guarding manually constructed Tasks.
+        # Re-grounding that same BK for each empty target used to consume the
+        # discovery budget before the labelled target could be certified.
+        names={name for name,_ in empty_keys}
+        for position,atom in enumerate(task.atoms):
+            if position%1024==0:
+                check()
+            if atom.name in names and signature(atom) in empty_keys:
+                raise ValueError("Empty-target bound requires target predicates absent from the fixed BK")
     grouped={key:[] for key in scopes}
     for candidate in pool.values():
         check()
@@ -86,8 +100,15 @@ def collect_verified_target_bounds(task,pool,previous,analysis,check,*,verify_ta
             if not analysis.heads[head].accepts(tuple(row['body']),check=check):
                 raise ValueError("Target incumbent is not legal in the original bias")
         rules=[row['rule'] for row in chosen]
-        verification=(verify_rules(target_view(task,key),rules) if verify_target is None
-                      else verify_target(key,rules))
+        if not mask:
+            verification={'matched':True,'hard_labels_matched':True,'coverage_mode':'strict',
+                'positive_count':0,'covered_positives':0,'missed_positives':0,'positive_recall':1.0,
+                'missing_positives':[],'covered_negatives':[],'predictions':[],
+                'scope':'Empty program over validated fixed BK with absent targets; all supplied hard labels',
+                'method':'validated_empty_program','diagnostics':[]}
+        else:
+            verification=(verify_rules(target_view(task,key),rules) if verify_target is None
+                          else verify_target(key,rules))
         check()
         if not verification['matched']:
             raise ValueError("Target incumbent failed original-BK verification")

@@ -9,7 +9,10 @@ restrictions are introduced.
 """
 
 from math import isfinite
+from fractions import Fraction
 import time
+
+import clingo
 
 from .oracle import ResourceLimit, match
 from .alpha_collection import VariantRecords
@@ -19,11 +22,180 @@ from .search import _analysis, _finish_variants, _members
 from .task import signature, variables
 
 
+class _DynamicBounds:
+    """Cheap covers are proposals only; independent BK evaluation certifies them.
+
+    Revisions retain cost equality. The resulting catalogue preserves optimal
+    complete programs and their variants, but not every suboptimal signature.
+    No cover solver is run in the candidate loop.
+    """
+
+    def __init__(self, search, scopes, interval, probes, exact, callback):
+        self.search, self.scopes = search, scopes
+        self.interval, self.callback = interval, callback
+        self.pools = {key: {} for key, mask in scopes.items() if mask}
+        self.covered = {key: 0 for key in self.pools}
+        self.pending = {key: 0 for key in self.pools}
+        self.certificates = {}
+        self.chosen = {}
+        self.incumbent = None
+        self.scope_options = {}
+        for key, mask in scopes.items():
+            if not mask:
+                continue
+            contexts = [context for head, context in search.contexts.items() if signature(head) == key]
+            minimum = 1 if any(search.accepts(context[0], ()) for context in contexts) else 2
+            positions = tuple(_members(mask))
+            count = min(probes, len(positions)) if exact else 0
+            pilots = (tuple(positions[i * (len(positions) - 1) // (count - 1)] for i in range(count))
+                      if count > 1 else positions[:1] if count else ())
+            self.scope_options[key] = minimum, mask, pilots
+        search.exact_program_bound = exact
+        search.stats.update(dynamic_program_bound=True, dynamic_bound_interval=interval,
+            dynamic_bound_cover_attempts=0, dynamic_bound_verifications=0,
+            dynamic_bound_updates=0, dynamic_global_bound_updates=0,
+            dynamic_retired_signatures=0,
+            dynamic_target_bounds=self.certificates, dynamic_incumbent=None,
+            dynamic_bound_history=[],
+            catalogue_scope="sufficient_for_optimal_complete_programs_under_verified_decreasing_bounds")
+
+    def ceiling(self, key):
+        limits = [self.search.program_bound]
+        if key in self.search.target_program_scopes:
+            limits.append(self.search.target_program_scopes[key][0])
+        return min((value for value in limits if value is not None), default=None)
+
+    def greedy(self, key):
+        self.search.stats["dynamic_bound_cover_attempts"] += 1
+        remaining, selected = self.scopes[key], []
+        rows = self.pools[key].values()
+        while remaining:
+            self.search.check()
+            useful = [row for row in rows if row["coverage"] & remaining]
+            if not useful:
+                return None
+            chosen = min(useful, key=lambda row: (
+                Fraction(row["cost"], (row["coverage"] & remaining).bit_count()), row["cost"], row["rule"]))
+            selected.append(chosen)
+            remaining &= ~chosen["coverage"]
+        for row in list(reversed(selected)):
+            self.search.check()
+            covered = 0
+            for other in selected:
+                if other is not row:
+                    covered |= other["coverage"]
+            if covered == self.scopes[key]:
+                selected.remove(row)
+        return selected
+
+    def consider(self, head, row):
+        key = signature(head)
+        previous_union = self.covered[key]
+        self.pools[key][row["coverage"]] = row
+        self.covered[key] |= row["coverage"]
+        self.pending[key] += 1
+        if self.covered[key] != self.scopes[key]:
+            return
+        proposed = None
+        if row["coverage"] == self.scopes[key]:
+            proposed = [row]
+        old = self.chosen.get(key)
+        if old is not None:
+            # A newly discovered rule can immediately replace several incumbent
+            # components. The mask test is exact and needs no cover solve.
+            replacement = [item for item in old if item["coverage"] & ~row["coverage"]] + [row]
+            if proposed is None or sum(item["cost"] for item in replacement) < sum(item["cost"] for item in proposed):
+                proposed = replacement
+        if previous_union != self.scopes[key] or self.pending[key] >= self.interval:
+            greedy = self.greedy(key)
+            self.pending[key] = 0
+            if proposed is None or sum(item["cost"] for item in greedy) < sum(item["cost"] for item in proposed):
+                proposed = greedy
+        if proposed is not None:
+            self.publish_target(key, proposed)
+
+    def publish_target(self, key, rows):
+        from .target_bounds import key_text, target_view
+        from .verification import verify_rules
+        cost = sum(row["cost"] for row in rows)
+        ceiling = self.ceiling(key)
+        if ceiling is not None and (cost > ceiling or
+                (cost == ceiling and key_text(key) in self.certificates)):
+            return
+        rules = [row["rule"] for row in rows]
+        self.search.check()
+        self.search.stats["dynamic_bound_verifications"] += 1
+        # A singleton target can verify the complete task in the same call;
+        # this avoids grounding a large original BK twice for one improvement.
+        single = len(self.pools) == 1
+        verification = verify_rules(self.search.task if single else target_view(self.search.task, key), rules)
+        if not verification["matched"]:
+            raise ValueError("Dynamic incumbent failed original-BK verification")
+        certificate = {"status": "verified", "signature": list(key), "cost": cost,
+            "positive_count": self.scopes[key].bit_count(), "positive_mask": hex(self.scopes[key]),
+            "rules": rules, "cover": [dict(row, coverage=hex(row["coverage"])) for row in rows],
+            "verification": {name: value for name, value in verification.items() if name != "predictions"},
+            "predicted_count": len(verification["predictions"]),
+            "scope": "Feasible upper bound for this complete target signature; not an optimum"}
+        self.certificates[key_text(key)] = certificate
+        self.chosen[key] = list(rows)
+        self.search.target_program_scopes[key] = (cost, *self.scope_options[key])
+        stats = self.search.stats
+        stats.setdefault("program_bounds", {})[key_text(key)] = cost
+        stats.setdefault("target_minimum_useful_rule_cost", {})[key_text(key)] = self.scope_options[key][0]
+        stats.setdefault("target_bound_positive_pilot_positions", {})[key_text(key)] = list(self.scope_options[key][2])
+        stats["dynamic_bound_updates"] += 1
+        stats["dynamic_bound_history"].append({"signature": key_text(key), "cost": cost,
+            "nodes": stats["nodes"], "elapsed_seconds": time.monotonic() - self.search.started})
+        target = stats["target_search"][key_text(key)]
+        target.update(verified_target_bound=cost,
+                      effective_body_limit=min(target["effective_body_limit"], max(0, cost - 1)))
+        # Publish completed verification before checking the deadline: an
+        # interruption must retain this feasible program and its certificate.
+        if single:
+            self.publish_global(rows, verification)
+        elif len(self.certificates) == len(self.pools):
+            combined = [row for chosen in self.chosen.values() for row in chosen]
+            self.publish_global(combined)
+        self.search.check()
+
+    def publish_global(self, rows, verification=None):
+        from .verification import verify_rules
+        cost = sum(row["cost"] for row in rows)
+        if self.search.program_bound is not None and cost >= self.search.program_bound:
+            return
+        rules = [row["rule"] for row in rows]
+        if verification is None:
+            self.search.check()
+            self.search.stats["dynamic_bound_verifications"] += 1
+            verification = verify_rules(self.search.task, rules)
+        if not verification["matched"]:
+            raise ValueError("Dynamic complete incumbent failed original-BK verification")
+        self.incumbent = {"status": "verified", "cost": cost, "rules": rules,
+            "cover": [dict(row, coverage=hex(row["coverage"])) for row in rows],
+            "verification": {name: value for name, value in verification.items() if name != "predictions"},
+            "predicted_count": len(verification["predictions"]),
+            "scope": "Feasible upper bound for all supplied hard labels; not an optimum"}
+        self.search.program_bound = cost
+        self.search.minimum_rule_cost = min(options[0] for options in self.scope_options.values())
+        self.search.stats.update(program_bound=True, program_bound_value=cost,
+            exact_program_bound=self.search.exact_program_bound, dynamic_incumbent=self.incumbent)
+        self.search.stats["dynamic_global_bound_updates"] += 1
+        if self.callback is not None:
+            self.callback(self.incumbent)
+
+    def finish(self):
+        for key in self.pools:
+            if self.pending[key] and self.covered[key] == self.scopes[key]:
+                self.publish_target(key, self.greedy(key))
+                self.pending[key] = 0
+
+
 class _Search:
     def __init__(self, task, oracle, seconds, order, progress, alpha_collect=True,
                  ground_prefix_filter=True, prefix_completion=True):
-        if not isfinite(seconds) or seconds < 0:
-            raise ValueError("Compilation seconds must be finite and nonnegative")
+        if seconds is not None and (not isfinite(seconds) or seconds < 0):
+            raise ValueError("Compilation seconds must be finite and nonnegative, or None")
         if order not in {"source", "selectivity"}:
             raise ValueError("order must be source or selectivity")
         if type(ground_prefix_filter) is not bool:
@@ -41,8 +213,9 @@ class _Search:
         self.bound_positive_pilots = ()
         self.minimum_rule_cost = None
         self.target_program_scopes = {}
+        self.dynamic_bounds = None
         self.started = time.monotonic()
-        self.deadline = self.started + seconds
+        self.deadline = self.started + seconds if seconds is not None else float("inf")
         self.original_check = oracle.check
         self.stats = {"backend": "relational_positive_bitmasks", "complete": False,
                       "positive_core_pruning": self.positive_cores is not None, "pruned_positive_core": 0,
@@ -218,9 +391,14 @@ class _Search:
         return result
 
     def program_scope(self, head):
-        return self.target_program_scopes.get(signature(head),
-            (self.program_bound, self.minimum_rule_cost, self.global_positive_mask,
-             self.bound_positive_pilots))
+        scoped = self.target_program_scopes.get(signature(head))
+        if scoped is not None:
+            limit, minimum, mask, pilots = scoped
+            if self.program_bound is not None:
+                limit = min(limit, self.program_bound)
+            return limit, minimum, mask, pilots
+        return (self.program_bound, self.minimum_rule_cost, self.global_positive_mask,
+                self.bound_positive_pilots)
 
     def full_positive(self, head, body):
         """Prove coverage of every positive, stopping on the first exact failure.
@@ -273,6 +451,8 @@ class _Search:
         previous = self.classes.get(coverage)
         if previous is None or row["cost"] < previous["cost"]:
             self.classes[coverage], self.records[coverage] = row, [row]
+            if self.dynamic_bounds is not None:
+                self.dynamic_bounds.consider(head, row)
         elif row["cost"] == previous["cost"]:
             if variants == "exhaustive":
                 self.records[coverage].append(row)
@@ -282,8 +462,6 @@ class _Search:
     def walk(self, maximum, variants="exhaustive", goals=None, *, final_pass=False):
         finished_heads = set()
         for head, context in self.contexts.items():
-            limit, minimum_cost, scope_mask, _ = self.program_scope(head)
-            head_maximum = min(maximum, limit - 1) if limit is not None else maximum
             if final_pass and "target_search" in self.stats:
                 self.stats["target_search"][f"{head.name}/{len(head.arguments)}"]["started"] = True
             proof, closures, masks, unavailable, order, prefix, all_positive = context
@@ -298,6 +476,13 @@ class _Search:
                     self.stats['pruned_positive_core'] += 1
                     return
                 size = body_bits.bit_count()
+                # Bounds may tighten when a previous branch contributes a new
+                # independently verified cover. Never freeze them per head.
+                limit, minimum_cost, scope_mask, _ = self.program_scope(head)
+                head_maximum = min(maximum, limit - 1) if limit is not None else maximum
+                if size > head_maximum:
+                    self.stats["pruned_program_bound"] += 1
+                    return
                 if (limit is not None and possible != scope_mask
                         and size + 1 + minimum_cost > limit):
                     # An extension can only lose positive coverage. A partial
@@ -374,6 +559,11 @@ class _Search:
                 if size >= head_maximum:
                     return
                 for position in range(start, len(order)):
+                    if self.dynamic_bounds is not None:
+                        current_limit = self.program_scope(head)[0]
+                        head_maximum = min(maximum, current_limit - 1) if current_limit is not None else maximum
+                        if size >= head_maximum:
+                            return
                     literal = order[position]
                     if body_bits >> literal & 1 or unavailable >> literal & 1:
                         continue
@@ -422,7 +612,8 @@ class _Search:
 def compile_catalogue(task, oracle, *, bound=None, seconds=300, progress=None,
                       order="selectivity", variants="exhaustive", program_bound=False, alpha_collect=True,
                       exact_program_bound=True, bound_positive_probes=24, ground_prefix_filter=True,
-                      prefix_completion=True, target_bounds=None):
+                      prefix_completion=True, target_bounds=None, dynamic_program_bound=False,
+                      dynamic_bound_interval=256, on_incumbent=None):
     """Compile a minimum-cost nondominated coverage catalogue.
 
     The default preserves the usual catalogue restricted by a per-rule bound.
@@ -441,6 +632,15 @@ def compile_catalogue(task, oracle, *, bound=None, seconds=300, progress=None,
     positive masks retain their original global positions. Missing target
     bounds fall back to the existing global bound or the original grammar.
 
+    dynamic_program_bound=True proposes cheap covers of discovered exact rules
+    and independently verifies improving incumbents against the original BK.
+    It preserves optimal complete programs, including equal-cost variants, but
+    changes the unrestricted catalogue contract and must not be used for a
+    partial-positive-coverage objective. Dynamic certificates are returned in
+    stats (also ResourceLimit.stats). on_incumbent receives each verified full
+    improvement immediately and may interrupt compilation to switch strategy.
+    A None time budget has no deadline.
+
     The extra rule-cost lower bound is derived from empty-body legality in the
     actual bias, never from the discovered pool. Minimum-cost programs <= bound
     retain their direct traversal paths; the proof does not rely on discovering
@@ -450,6 +650,12 @@ def compile_catalogue(task, oracle, *, bound=None, seconds=300, progress=None,
         raise ValueError("program_bound must be a boolean")
     if type(exact_program_bound) is not bool:
         raise ValueError("exact_program_bound must be a boolean")
+    if type(dynamic_program_bound) is not bool:
+        raise ValueError("dynamic_program_bound must be a boolean")
+    if type(dynamic_bound_interval) is not int or dynamic_bound_interval < 1:
+        raise ValueError("dynamic_bound_interval must be a positive integer")
+    if on_incumbent is not None and (not callable(on_incumbent) or not dynamic_program_bound):
+        raise ValueError("on_incumbent requires dynamic_program_bound and must be callable")
     if type(bound_positive_probes) is not int or bound_positive_probes < 0:
         raise ValueError("bound_positive_probes must be a nonnegative integer")
     if program_bound and (type(bound) is not int or bound <= 0):
@@ -512,14 +718,28 @@ def compile_catalogue(task, oracle, *, bound=None, seconds=300, progress=None,
             "effective_body_limit": min(maximum, target_bounds[key] - 1)
                 if target_bounds and key in target_bounds and mask else maximum}
             for key, mask in scopes.items()}
+        if dynamic_program_bound:
+            search.dynamic_bounds = _DynamicBounds(search, scopes, dynamic_bound_interval,
+                bound_positive_probes, exact_program_bound, on_incumbent)
         # Cheap legal rules often dominate long prefixes. Seed them without
         # altering the later exhaustive traversal or using any target schema.
         if maximum > 1:
             search.walk(1, variants)
         search.walk(maximum, variants, final_pass=True)
+        if search.dynamic_bounds is not None:
+            search.dynamic_bounds.finish()
         retained = []
         for row in sorted(search.classes.values(), key=lambda row: (row["cost"], row["rule"])):
             search.check()
+            if search.dynamic_bounds is not None:
+                limit, minimum, mask, _ = search.program_scope(clingo.parse_term(row["head"]))
+                if limit is not None and (row["cost"] > limit or
+                        (row["coverage"] != mask and row["cost"] + minimum > limit)):
+                    # Earlier passes can retain components excluded by a later
+                    # verified bound. Retiring them also keeps targeted variant
+                    # reconstruction aligned with its final traversal scope.
+                    search.stats["dynamic_retired_signatures"] += 1
+                    continue
             if any(previous["cost"] < row["cost"] and previous["coverage"] | row["coverage"] == previous["coverage"]
                    for previous in retained):
                 continue
@@ -532,7 +752,9 @@ def compile_catalogue(task, oracle, *, bound=None, seconds=300, progress=None,
             search.walk(max(cost for cost, _ in goals) - 1, goals=goals)
         return search.finish(retained, variants)
     except ResourceLimit as error:
-        error.stats.update(oracle_queries=dict(oracle.stats), indexes=dict(oracle.space.stats),
+        # ResourceLimit can originate in an oracle or caller rather than our
+        # own deadline check; always attach the latest verified incumbents.
+        error.stats.update(search.stats, oracle_queries=dict(oracle.stats), indexes=dict(oracle.space.stats),
                            profile=oracle.profile.export(), alpha_collection=search.records.export())
         raise
     finally:

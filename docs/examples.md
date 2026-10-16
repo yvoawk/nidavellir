@@ -95,6 +95,14 @@ nidavellir \
   --compiler-backend relational
 ```
 
+This strict representative run uses the automatic direct-proof route when a
+verified incumbent is available. Inspect `program_proof.json` and `solver.json`
+for the proof of no cheaper program. To compare catalogues instead, add
+`--proof-strategy catalogue`; also add `--no-dynamic-program-bounds` and
+`--bound-seconds 0` when comparing an unrestricted reference catalogue rather
+than optimal-program preservation. Optimum and variant enumeration automatically retain the
+catalogue route.
+
 Use a fresh output path for every invocation. Nidavellir refuses to overwrite
 an existing run directory so that evidence from an earlier run is not silently
 mixed with new results.

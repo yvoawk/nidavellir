@@ -203,6 +203,10 @@ class BiasAnalysisTests(unittest.TestCase):
     def test_unknown_query_is_not_a_proof_of_impossibility(self):
         task = self.task(["p(var__(1))", "q(var__(1))"])
         proof = analyze(task).heads[task.heads[0]]
+        # Exercise an actual solver fallback, rather than a separately proved
+        # complete-body result or a previously obtained satisfiable witness.
+        proof._checker.compiled_legality = None
+        proof._checker.witnesses.clear()
         original = proof._checker.control
         proof._checker.control = SimpleNamespace(solve=lambda **_: SimpleNamespace(unknown=True))
         try:

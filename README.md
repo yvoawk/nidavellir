@@ -4,9 +4,10 @@
 
 Nidavellir compiles a finite, explicitly biased inductive logic programming
 (ILP) task into a minimum-cost set of positive rules. It evaluates candidate
-rules against a fixed Answer Set Programming (ASP) background, compiles their
-exact positive coverage, rejects rules covering supplied negative examples,
-and solves the resulting weighted set-cover problem.
+rules against a fixed Answer Set Programming (ASP) background and rejects rules
+covering supplied negative examples. It can prove a verified program optimal
+by ruling out every cheaper program, or compile exact positive coverage and
+solve the resulting weighted set-cover problem.
 
 The compiler is domain independent. Its three inputs are a background
 knowledge file (BK), positive and negative examples (hard by default), and an ASP bias that
@@ -82,7 +83,58 @@ t(V1) :- q(V1).
 The rule cost is one for the head plus one per selected body literal, so this
 two-rule program has cost four.
 
-Internal selection uses Clingo's core-guided `usc,oll` optimization strategy.
+## Proof strategy and time budgets
+
+Since 0.3.28, `--proof-strategy auto` uses direct program proof for strict
+relational runs that request one representative optimum with the internal
+optimizer. Given an independently verified program of cost `U`, it searches
+the original finite language for a feasible program costing less than `U`.
+Each verified improvement lowers `U`; exhausted UNSAT proves the incumbent
+optimal. A complete rule catalogue is not required for this proof.
+
+| Option | Behavior |
+| --- | --- |
+| `--proof-strategy auto` | Use direct proof when eligible; otherwise retain catalogue compilation and selection. |
+| `--proof-strategy cegis` | Require strict relational representative optimization with the internal optimizer and no ILASP verification. |
+| `--proof-strategy catalogue` | Retain catalogue compilation followed by finite set-cover optimization. |
+| `--dynamic-program-bounds` | Default: independently verify improving covers discovered during strict relational compilation and tighten bounds immediately. |
+| `--no-dynamic-program-bounds` | Disable these online revisions; initial verified bounds still apply. |
+
+The catalogue route remains in use for bitmask compilation, partial coverage,
+optimum enumeration, variant expansion, and ILASP selection or verification.
+Direct proof needs a feasible incumbent: if initial bound discovery finds none,
+compilation can supply one through dynamic bounds. If no incumbent is found,
+completed catalogue compilation and selection still decide feasibility.
+
+Use `--target-signature predicate/arity` to learn only that declared signature;
+all its head templates and the original rule-level bias remain available.
+This is useful when the examples concern one target but the bias declares many.
+
+For example, to run the bundled task without oracle, compilation, proof, or
+selection deadlines:
+
+```bash
+nidavellir \
+  --background examples/overlapping_rules/background.lp \
+  --examples examples/overlapping_rules/examples.lp \
+  --bias examples/overlapping_rules/bias.lp \
+  --compiler-backend relational \
+  --target-signature t/1 \
+  --proof-strategy auto \
+  --no-time-limit \
+  --output /tmp/nidavellir-unlimited
+```
+
+`--no-time-limit` requires explicit `--compiler-backend relational` and cannot
+be combined with `--enumerate-optima` or `--expand-variants`. These phase budgets
+become `None`, meaning no deadline, rather than a large numeric timeout. Initial
+bound discovery retains its finite `--bound-seconds` budget (30 seconds by
+default); `--bound-seconds 0` disables that heuristic phase. Other resource limits
+and explicit interruptions still apply. With finite budgets, a verified
+incumbent survives a proof or compilation timeout as `feasible`, never `optimal`.
+
+On the catalogue route, internal selection uses Clingo's core-guided `usc,oll`
+optimization strategy.
 Use `--internal-opt-strategy bb,lin` to reproduce the previous branch-and-bound
 strategy. Both optimize exactly the same compiled catalogue and objective;
 the chosen strategy is recorded in `solver.json`. If selection times out, the
@@ -122,7 +174,8 @@ false while the hypothesis is valid under the selected partial objective.
 
 Both compiler backends, both optimizers, separate/grouped targets, and optional
 optimum/variant enumeration support the flag. The full-cover bound worker and
-its per-target cost bounds are disabled for this mode; `--resume-bound` is
+its per-target cost bounds and dynamic revisions are disabled for this mode;
+direct program proof is also disabled. `--resume-bound` is
 incompatible. Compilation must finish before maximum coverage is certified.
 A selection timeout may retain a maximum-coverage hypothesis without proving
 minimum cost. An empty positive set has recall 1 by convention; when no
@@ -179,9 +232,11 @@ include:
 - `inputs/`: normalized, hashed snapshots of all three inputs;
 - `manifest.json`: versions, arguments, hashes, task sizes, and engine hashes;
 - `planning.json`, `oracle.json`, and `bound.json`: backend and proof metadata;
-- `catalogue.json`: retained negative-safe cost/coverage candidates;
-- `compiled_set_cover.lp` and `compiled_ilasp.las`: compiled selection tasks;
-- `solver.json`: selection result and its proof/completion state;
+- `catalogue.json`: retained negative-safe cost/coverage candidates on the catalogue route;
+- `compiled_set_cover.lp` and `compiled_ilasp.las`: catalogue-route selection tasks;
+- `program_proof.json`: strict-improvement search evidence on the direct-proof route;
+- `dynamic_incumbent.json`: a newly verified full program discovered during compilation, when available;
+- `solver.json`: optimization result and its proof/completion state;
 - `learned.lp`, `predictions.lp`, and `verification.json`: emitted hypothesis
   and independent evaluation in the original BK;
 - `trace.jsonl`: machine-readable progress events.
@@ -196,16 +251,20 @@ See [Compiler pipeline](docs/compiler-pipeline.md) for the lifecycle and
 
 ## Guarantees and limits
 
-When `status.json` reports `"status": "complete"`, Nidavellir has completed the
-finite catalogue and selection needed to prove the reported minimum cost under
-the supplied BK, labels, and bias. Every emitted hypothesis is independently
-checked against all supplied hard labels in the original BK.
+When `status.json` reports `"status": "complete"`, Nidavellir has proved the
+reported minimum cost under the supplied BK, labels, and bias. Evidence is either
+complete catalogue compilation and selection, or exhausted UNSAT for all
+programs strictly cheaper than a verified incumbent. Direct proof records
+`catalogue_complete: false`; this is compatible with a proved optimum. Every
+emitted hypothesis is independently checked against the supplied hard labels
+in the original BK.
 
 Important boundaries:
 
 - A `feasible` result satisfies the selected coverage mode and covers no
   supplied negatives, but is not a proof of minimum cost.
-- A timeout or resource limit means `incomplete`, never unsatisfiable.
+- A timeout or resource limit leaves `feasible` when a verified hypothesis is
+  available, otherwise `incomplete`; it never means unsatisfiable.
 - Catalogue completion does not automatically enumerate every tied optimum or
   every alpha-renamed spelling. Request `--enumerate-optima --expand-variants`
   and inspect their separate completion fields.
